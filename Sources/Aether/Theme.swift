@@ -467,31 +467,48 @@ struct Hero: View {
     }
 }
 
+/// Remembers when a scan's counter last moved, to tell "slow" from "waiting on you".
+final class StallTracker {
+    private var files = -1
+    private var since = Date()
+    func stalledFor(_ current: Int) -> TimeInterval {
+        if current != files { files = current; since = Date() }
+        return Date().timeIntervalSince(since)
+    }
+}
+
 struct ScanningView: View {
     let module: Module
     let title: String
     var progress: ScanProgress?
     var label: String = ""
     var cancel: (() -> Void)?
+    @State private var tracker = StallTracker()
 
     var body: some View {
         VStack(spacing: 24) {
             SpinnerBadge(module: module)
             Text(title).font(.display(32))
-            TimelineView(.periodic(from: .now, by: 0.12)) { _ in
+            TimelineView(.periodic(from: .now, by: 0.25)) { _ in
                 let s = progress?.snapshot
+                let stalled = s.map { tracker.stalledFor($0.files) } ?? 0
                 VStack(spacing: 4) {
                     if let s, s.files > 0 {
-                        Text("\(s.files.formatted()) items checked").monospacedDigit()
+                        Text("\(s.files.formatted()) items checked" + (s.bytes > 0 ? " · \(Bytes.string(s.bytes))" : "")).monospacedDigit()
                     } else if !label.isEmpty {
                         Text(label)
                     }
                     Text(s?.current ?? "")
                         .font(.caption).foregroundStyle(.white.opacity(0.45))
                         .lineLimit(1).truncationMode(.middle).frame(maxWidth: 420)
+                    if progress != nil, stalled > 4 {
+                        Text("Nothing has moved for \(Int(stalled)) seconds. If macOS asked to let Aether access a folder, choose Allow. Granting Full Disk Access in System Settings stops those prompts for good.")
+                            .font(.caption).foregroundStyle(.yellow.opacity(0.9))
+                            .multilineTextAlignment(.center).frame(maxWidth: 440).padding(.top, 8)
+                    }
                 }
                 .font(.callout).foregroundStyle(.white.opacity(0.7))
-                .frame(height: 38)
+                .frame(minHeight: 38)
             }
             if let cancel { Button("Stop", action: cancel).buttonStyle(SoftButtonStyle()) }
         }

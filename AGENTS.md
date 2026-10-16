@@ -30,6 +30,16 @@ Aether is a Mac cleaning and care suite in Swift and SwiftUI (macOS 14+). Comman
 - Some locations need Full Disk Access; show the banner rather than failing silently. Admin tasks use the standard macOS password prompt.
 - Add a check to `AetherCheck` for every new rule in `Remover` or the catalog.
 
+## Scanning rules (learned the hard way)
+
+- Walk folders with `BulkDir` (`getattrlistbulk`), not `FileManager.enumerator` or per-file `resourceValues`. It scans a whole home folder
+  (1.6 million items) in about 13 s; the Foundation walk took many minutes. `swift run AetherCheck --bench` prints the timings on this Mac.
+- Never open a folder whose entry is `isDataless` (stored only in iCloud). Opening it makes macOS fetch the listing and can block for minutes.
+- A thread blocked in `open()` cannot be interrupted, for example while macOS waits for the user to answer a privacy prompt.
+  So async scan entry points return through a `ResultGate` that a stop request or time limit can finish early. Do not `await` the worker threads.
+- Every scanning screen must show progress and a Stop button, and say so when nothing has moved for a few seconds (`ScanningView` does this).
+- Reset a `ScanProgress` before reusing it, or an earlier Stop will cancel the next scan.
+
 ## Releasing
 
 Tag `vX.Y.Z` (matching `VERSION` in `Scripts/build_app.sh`): `.github/workflows/release.yml` builds and attaches `Aether-X.Y.Z-macos.zip`. By hand, a release is: bump `VERSION` in `Scripts/build_app.sh`, run `Scripts/build_app.sh`, zip `build/Aether.app` with

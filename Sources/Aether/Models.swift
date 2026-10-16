@@ -157,6 +157,7 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
 
     func scan() {
         phase = .scanning
+        progress.reset()
         let min = Int64(minSizeMB) * 1_000_000
         let roots = roots
         task = Task {
@@ -197,6 +198,7 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
 
     func scan() {
         phase = .scanning
+        progress.reset()
         let roots = roots
         task = Task {
             let g = await DuplicateScanner.scan(roots: roots, progress: progress)
@@ -251,6 +253,7 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
         if let url { root = url }
         phase = .scanning
         message = nil
+        progress.reset()
         let root = root
         task = Task {
             let node = await SpaceLensScanner.scan(root: root, progress: progress)

@@ -79,3 +79,39 @@ public final class ScanProgress: @unchecked Sendable {
         return (_files, _bytes, _current)
     }
 }
+
+/// Hands a result to an async caller exactly once, from whichever finishes first: the worker, or a stop request.
+/// Worker threads can be blocked inside the kernel (for example while macOS waits for a privacy prompt to be answered)
+/// and cannot be interrupted, so the caller must not wait on them.
+final class ResultGate<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: T?
+    private var continuation: CheckedContinuation<T, Never>?
+
+    var isDone: Bool { lock.lock(); defer { lock.unlock() }; return result != nil }
+
+    func install(_ c: CheckedContinuation<T, Never>) {
+        lock.lock()
+        if let r = result { lock.unlock(); c.resume(returning: r) } else { continuation = c; lock.unlock() }
+    }
+
+    func finish(_ value: T) {
+        lock.lock()
+        if result != nil { lock.unlock(); return }
+        result = value
+        let c = continuation
+        continuation = nil
+        lock.unlock()
+        c?.resume(returning: value)
+    }
+
+    /// Polls `stop` and finishes the gate with `partial()` as soon as it says so.
+    func watch(stop: @escaping @Sendable () -> Bool, partial: @escaping @Sendable () -> T) {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            while !isDone {
+                Thread.sleep(forTimeInterval: 0.2)
+                if stop() { finish(partial()); return }
+            }
+        }
+    }
+}

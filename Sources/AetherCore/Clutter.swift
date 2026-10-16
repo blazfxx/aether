@@ -27,61 +27,105 @@ public struct FileEntry: Identifiable, Hashable, Sendable {
 }
 
 public enum LargeFileScanner {
-    private static let keys: [URLResourceKey] = [
-        .totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey, .isPackageKey,
-        .contentModificationDateKey, .contentAccessDateKey, .isSymbolicLinkKey, .isDirectoryKey,
-    ]
     /// Folders full of small generated files: never where a large file you care about lives, and slow to walk.
     private static let skippedFolders: Set<String> = ["node_modules", "Pods", "DerivedData", "__pycache__", ".venv", "venv"]
     /// Packages we should never offer up as "large files".
     private static let protectedPackages: Set<String> = ["photoslibrary", "musiclibrary", "tvlibrary", "imovielibrary", "fcpbundle"]
+    /// Folders that macOS treats as one item (and that we size as a whole instead of walking into).
+    private static let packageExtensions: Set<String> = [
+        "app", "bundle", "framework", "plugin", "xcodeproj", "xcworkspace", "playground", "rtfd", "sparsebundle",
+        "pvm", "utm", "vmwarevm", "photoslibrary", "musiclibrary", "tvlibrary", "imovielibrary", "fcpbundle",
+    ]
+    /// Subfolders are walked in parallel this many levels down.
+    private static let parallelDepth = 2
+
+    private final class Run: @unchecked Sendable {
+        let minSize: Int64
+        let progress: ScanProgress
+        let deadline: Date?
+        private let lock = NSLock()
+        private var found: [FileEntry] = []
+
+        init(minSize: Int64, progress: ScanProgress, deadline: Date?) {
+            self.minSize = minSize; self.progress = progress; self.deadline = deadline
+        }
+
+        func shouldStop() -> Bool {
+            if progress.isCancelled { progress.markTruncated(); return true }
+            if let deadline, Date() > deadline { progress.markTruncated(); return true }
+            return false
+        }
+
+        func add(_ entries: [FileEntry]) {
+            guard !entries.isEmpty else { return }
+            lock.lock(); found.append(contentsOf: entries); lock.unlock()
+        }
+
+        var results: [FileEntry] { lock.lock(); defer { lock.unlock() }; return found }
+    }
 
     /// `timeLimit` stops the walk after that many seconds and returns what was found (the progress is marked truncated).
+    /// Cancelling the task or calling `progress.cancel()` does the same.
     public static func scan(
         roots: [URL], minSize: Int64, progress: ScanProgress, timeLimit: TimeInterval? = nil
     ) async -> [FileEntry] {
-        let deadline = timeLimit.map { Date().addingTimeInterval($0) }
-        let parts = await boundedMap(roots, limit: max(1, roots.count)) { root in
-            scanOne(root: root, minSize: minSize, progress: progress, deadline: deadline)
+        let run = Run(minSize: minSize, progress: progress, deadline: timeLimit.map { Date().addingTimeInterval($0) })
+        let gate = ResultGate<[FileEntry]>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<[FileEntry], Never>) in
+                gate.install(c)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    DispatchQueue.concurrentPerform(iterations: roots.count) { i in
+                        walk(roots[i].path, depth: 0, run)
+                    }
+                    gate.finish(run.results.sorted { $0.size > $1.size })
+                }
+                // A folder macOS is still waiting to open (privacy prompt) must not hold up Skip or the time limit.
+                gate.watch(stop: { run.shouldStop() }, partial: { run.results.sorted { $0.size > $1.size } })
+            }
+        } onCancel: {
+            progress.cancel()
         }
-        return parts.flatMap { $0 }.sorted { $0.size > $1.size }
     }
 
-    private static func scanOne(root: URL, minSize: Int64, progress: ScanProgress, deadline: Date?) -> [FileEntry] {
-        var out: [FileEntry] = []
-        guard let walker = FileManager.default.enumerator(
-            at: root, includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles, .skipsPackageDescendants],
-            errorHandler: { _, _ in true }) else { return [] }
-        var n = 0
-        for case let url as URL in walker {
-            n += 1
-            if n & 0x3F == 0 {
-                if Task.isCancelled || progress.isCancelled || (deadline.map { Date() > $0 } ?? false) {
-                    progress.markTruncated()
-                    break
-                }
-                progress.setCurrent(url.deletingLastPathComponent().path)
+    private static func walk(_ path: String, depth: Int, _ run: Run) {
+        if run.shouldStop() { return }
+        guard let entries = BulkDir.read(path, dates: true) else { return }
+        run.progress.add(files: entries.count)
+        if depth <= 2 { run.progress.setCurrent(path) }
+
+        let prefix = path == "/" ? "" : path
+        var local: [FileEntry] = []
+        var subdirs: [String] = []
+        for e in entries where !e.name.hasPrefix(".") {
+            func entry(_ size: Int64) -> FileEntry {
+                FileEntry(url: URL(fileURLWithPath: prefix + "/" + e.name), size: size,
+                          modified: e.modified > 0 ? Date(timeIntervalSince1970: TimeInterval(e.modified)) : nil,
+                          accessed: e.accessed > 0 ? Date(timeIntervalSince1970: TimeInterval(e.accessed)) : nil)
             }
-            guard let v = try? url.resourceValues(forKeys: Set(keys)), v.isSymbolicLink != true else { continue }
-            if v.isDirectory == true, v.isPackage != true, skippedFolders.contains(url.lastPathComponent) {
-                walker.skipDescendants()
-                continue
-            }
-            progress.add()
-            if v.isRegularFile == true {
-                let s = Int64(v.totalFileAllocatedSize ?? v.fileAllocatedSize ?? 0)
-                if s >= minSize {
-                    out.append(FileEntry(url: url, size: s, modified: v.contentModificationDate, accessed: v.contentAccessDate))
-                }
-            } else if v.isPackage == true, !protectedPackages.contains(url.pathExtension.lowercased()) {
-                let s = FileSizer.allocatedSize(of: url)
-                if s >= minSize {
-                    out.append(FileEntry(url: url, size: s, modified: v.contentModificationDate, accessed: v.contentAccessDate))
+            if e.type == BulkDir.regular {
+                if e.alloc >= run.minSize { local.append(entry(e.alloc)) }
+            } else if e.type == BulkDir.directory {
+                if skippedFolders.contains(e.name) || e.isDataless { continue }
+                let ext = (e.name as NSString).pathExtension.lowercased()
+                if packageExtensions.contains(ext) {
+                    if protectedPackages.contains(ext) { continue }
+                    let size = BulkDir.totalSize(prefix + "/" + e.name) { run.shouldStop() }
+                    if size >= run.minSize { local.append(entry(size)) }
+                } else {
+                    subdirs.append(e.name)
                 }
             }
         }
-        return out
+        run.add(local)
+
+        if depth < parallelDepth, subdirs.count > 1 {
+            DispatchQueue.concurrentPerform(iterations: subdirs.count) { i in
+                walk(prefix + "/" + subdirs[i], depth: depth + 1, run)
+            }
+        } else {
+            for d in subdirs { walk(prefix + "/" + d, depth: depth + 1, run) }
+        }
     }
 
     public static var defaultRoots: [URL] {

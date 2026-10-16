@@ -4,7 +4,8 @@ import CoreGraphics
 public final class DiskNode: Identifiable, @unchecked Sendable {
     public let id = UUID()
     public let name: String
-    public let url: URL
+    /// Filesystem path. Kept as a string while scanning: building a URL per folder is measurable on a million-file tree.
+    public let fsPath: String
     public let isDirectory: Bool
     /// Synthetic bucket that stands in for many small items that were pruned from the tree.
     public let isOther: Bool
@@ -12,9 +13,11 @@ public final class DiskNode: Identifiable, @unchecked Sendable {
     public var children: [DiskNode] = []
     public weak var parent: DiskNode?
 
-    init(name: String, url: URL, isDirectory: Bool, size: Int64, isOther: Bool = false) {
-        self.name = name; self.url = url; self.isDirectory = isDirectory; self.size = size; self.isOther = isOther
+    init(name: String, fsPath: String, isDirectory: Bool, size: Int64, isOther: Bool = false) {
+        self.name = name; self.fsPath = fsPath; self.isDirectory = isDirectory; self.size = size; self.isOther = isOther
     }
+
+    public var url: URL { URL(fileURLWithPath: fsPath, isDirectory: isDirectory) }
 
     public var canDrill: Bool { isDirectory && !children.isEmpty }
 
@@ -27,66 +30,73 @@ public final class DiskNode: Identifiable, @unchecked Sendable {
 }
 
 public enum SpaceLensScanner {
-    private static let keys: Set<URLResourceKey> = [
-        .totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey,
-    ]
     /// Anything smaller than this is folded into an "other" bucket to bound memory on huge trees.
     static let keepThreshold: Int64 = 1_000_000
     static let maxDepth = 7
+    /// Folders are scanned in parallel this many levels down; below that, one thread walks its own subtree.
+    static let parallelDepth = 3
 
+    /// `CloudStorage` holds third-party cloud mounts (Google Drive, Dropbox): reading them can hit the network.
     private static let skipNames: Set<String> = [".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100", ".TemporaryItems", "CloudStorage"]
 
+    /// Cancelling the task (or calling `progress.cancel()`) returns at once with an empty tree, even if worker threads
+    /// are still stuck waiting on macOS (for example on a privacy prompt).
     public static func scan(root: URL, progress: ScanProgress) async -> DiskNode {
-        let rootNode = DiskNode(name: root.lastPathComponent.isEmpty ? "/" : root.lastPathComponent,
-                                url: root, isDirectory: true, size: 0)
-        let entries = (try? FileManager.default.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: Array(keys), options: [])) ?? []
-
-        var topDirs: [URL] = []
-        var kids: [DiskNode] = []
-        var other: Int64 = 0
-        for e in entries where !skipNames.contains(e.lastPathComponent) {
-            guard let v = try? e.resourceValues(forKeys: keys), v.isSymbolicLink != true else { continue }
-            if v.isDirectory == true {
-                topDirs.append(e)
-            } else {
-                let s = Int64(v.totalFileAllocatedSize ?? v.fileAllocatedSize ?? 0)
-                progress.add(bytes: s)
-                if s >= keepThreshold { kids.append(DiskNode(name: e.lastPathComponent, url: e, isDirectory: false, size: s)) }
-                else { other += s }
+        let name = root.lastPathComponent.isEmpty ? "/" : root.lastPathComponent
+        let gate = ResultGate<DiskNode>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<DiskNode, Never>) in
+                gate.install(c)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    gate.finish(scanDir(path: root.path, name: name, depth: 0, progress: progress))
+                }
+                gate.watch(stop: { progress.isCancelled },
+                           partial: { DiskNode(name: name, fsPath: root.path, isDirectory: true, size: 0) })
             }
+        } onCancel: {
+            progress.cancel()
         }
-
-        let dirNodes = await boundedMap(topDirs) { dir in
-            scanDir(dir, depth: 1, progress: progress)
-        }
-        for d in dirNodes {
-            if d.size >= keepThreshold { kids.append(d) } else { other += d.size }
-        }
-        finish(rootNode, kids: kids, other: other)
-        return rootNode
     }
 
-    private static func scanDir(_ url: URL, depth: Int, progress: ScanProgress) -> DiskNode {
-        let node = DiskNode(name: url.lastPathComponent, url: url, isDirectory: true, size: 0)
-        if Task.isCancelled { return node }
-        if depth == 1 || depth == 2 { progress.setCurrent(url.path) }
-        let entries = (try? FileManager.default.contentsOfDirectory(
-            at: url, includingPropertiesForKeys: Array(keys), options: [])) ?? []
+    private static func scanDir(path: String, name: String, depth: Int, progress: ScanProgress) -> DiskNode {
+        let node = DiskNode(name: name, fsPath: path, isDirectory: true, size: 0)
+        if progress.isCancelled { return node }
+        if depth <= 2 { progress.setCurrent(path) }
+        guard let entries = BulkDir.read(path) else { return node }
+
+        let prefix = path == "/" ? "" : path
         var kids: [DiskNode] = []
         var other: Int64 = 0
-        for e in entries where !skipNames.contains(e.lastPathComponent) {
-            guard let v = try? e.resourceValues(forKeys: keys), v.isSymbolicLink != true else { continue }
-            if v.isDirectory == true {
-                let child = scanDir(e, depth: depth + 1, progress: progress)
-                if child.size >= keepThreshold { kids.append(child) } else { other += child.size }
-            } else {
-                let s = Int64(v.totalFileAllocatedSize ?? v.fileAllocatedSize ?? 0)
-                progress.add(bytes: s)
-                if s >= keepThreshold { kids.append(DiskNode(name: e.lastPathComponent, url: e, isDirectory: false, size: s)) }
-                else { other += s }
+        var fileBytes: Int64 = 0
+        var subdirs: [String] = []
+        for e in entries where !skipNames.contains(e.name) {
+            if e.type == BulkDir.regular {
+                fileBytes += e.alloc
+                if e.alloc >= keepThreshold { kids.append(DiskNode(name: e.name, fsPath: prefix + "/" + e.name, isDirectory: false, size: e.alloc)) }
+                else { other += e.alloc }
+            } else if e.type == BulkDir.directory, !e.isDataless {
+                subdirs.append(e.name)
             }
         }
+        progress.add(files: entries.count, bytes: fileBytes)
+
+        var children = [DiskNode?](repeating: nil, count: subdirs.count)
+        if depth < parallelDepth, subdirs.count > 1 {
+            children.withUnsafeMutableBufferPointer { buffer in
+                let base = buffer.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: subdirs.count) { i in
+                    base[i] = scanDir(path: prefix + "/" + subdirs[i], name: subdirs[i], depth: depth + 1, progress: progress)
+                }
+            }
+        } else {
+            for (i, d) in subdirs.enumerated() {
+                children[i] = scanDir(path: prefix + "/" + d, name: d, depth: depth + 1, progress: progress)
+            }
+        }
+        for case let child? in children {
+            if child.size >= keepThreshold { kids.append(child) } else { other += child.size }
+        }
+
         if depth >= maxDepth {
             // Too deep to keep: collapse into a sized leaf directory.
             node.size = kids.reduce(0) { $0 + $1.size } + other
@@ -99,7 +109,7 @@ public enum SpaceLensScanner {
     private static func finish(_ node: DiskNode, kids: [DiskNode], other: Int64) {
         var children = kids.sorted { $0.size > $1.size }
         if other > 0 {
-            children.append(DiskNode(name: "Smaller items", url: node.url, isDirectory: false, size: other, isOther: true))
+            children.append(DiskNode(name: "Smaller items", fsPath: node.fsPath, isDirectory: false, size: other, isOther: true))
         }
         for c in children { c.parent = node }
         node.children = children

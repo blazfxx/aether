@@ -183,6 +183,106 @@ struct ScannerTests {
     }
 }
 
+struct BulkDirTests {
+    private func write(_ n: Int, to url: URL) throws { try Data(repeating: 5, count: n).write(to: url) }
+
+    func entriesMatchLstatNamesTypesSizesAndDates() throws {
+        let root = try tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write(300_000, to: root.appendingPathComponent("a.bin"))
+        try write(5, to: root.appendingPathComponent("b.txt"))
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("d"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("ln"), withDestinationURL: root.appendingPathComponent("a.bin"))
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)],
+                                              ofItemAtPath: root.appendingPathComponent("a.bin").path)
+        guard let entries = BulkDir.read(root.path, dates: true) else { expect(false, "read returned nil"); return }
+        let byName = Dictionary(uniqueKeysWithValues: entries.map { ($0.name, $0) })
+        expect(Set(byName.keys) == ["a.bin", "b.txt", "d", "ln"], "\(byName.keys.sorted())")
+        for name in ["a.bin", "b.txt"] {
+            var st = stat()
+            expect(lstat(root.appendingPathComponent(name).path, &st) == 0)
+            expect(byName[name]?.alloc == Int64(st.st_blocks) * 512, "\(name) alloc \(byName[name]?.alloc ?? -1) vs \(Int64(st.st_blocks) * 512)")
+            expect(byName[name]?.type == BulkDir.regular)
+        }
+        expect(byName["d"]?.type == BulkDir.directory)
+        expect(byName["ln"]?.type == BulkDir.symlink)
+        expect(byName["a.bin"]?.modified == 1_600_000_000, "mtime \(byName["a.bin"]?.modified ?? -1)")
+        expect((byName["a.bin"]?.accessed ?? 0) > 1_500_000_000)
+    }
+
+    func totalSizeMatchesAFoundationWalk() throws {
+        let root = try tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for d in 0..<5 {
+            let dir = root.appendingPathComponent("d\(d)/sub")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for f in 0..<8 { try write(1_000 * (d + 1) * (f + 1) + 17, to: dir.appendingPathComponent("f\(f).bin")) }
+        }
+        func oracle(_ url: URL) -> Int64 {
+            var total: Int64 = 0
+            let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .isRegularFileKey]
+            for case let u as URL in FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys)! {
+                let v = try? u.resourceValues(forKeys: Set(keys))
+                if v?.isRegularFile == true { total += Int64(v?.totalFileAllocatedSize ?? 0) }
+            }
+            return total
+        }
+        expect(BulkDir.totalSize(root.path) == oracle(root), "tmp tree")
+        expect(FileSizer.allocatedSize(of: root) == oracle(root))
+        // A real, static tree as a second opinion (skipped if the Command Line Tools are not installed).
+        let real = URL(fileURLWithPath: "/Library/Developer/CommandLineTools/usr/include")
+        if FileManager.default.fileExists(atPath: real.path) {
+            expect(BulkDir.totalSize(real.path) == oracle(real), "CLT include")
+        }
+    }
+
+    func bigDirectoriesSpanSeveralBuffers() throws {
+        let root = try tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for i in 0..<6_000 { FileManager.default.createFile(atPath: root.appendingPathComponent("file-with-a-fairly-long-name-\(i).txt").path, contents: nil) }
+        let entries = BulkDir.read(root.path) ?? []
+        expect(entries.count == 6_000, "\(entries.count)")
+        expect(Set(entries.map(\.name)).count == 6_000)
+    }
+
+    func missingOrForbiddenDirectoryIsNil() {
+        expect(BulkDir.read("/definitely/not/here") == nil)
+        expect(BulkDir.read("/etc/hosts") == nil)   // a file, not a directory
+    }
+}
+
+struct GateTests {
+    func firstResultWinsAndALateListenerStillGetsIt() async {
+        let g = ResultGate<Int>()
+        g.finish(1); g.finish(2)
+        let v = await withCheckedContinuation { (c: CheckedContinuation<Int, Never>) in g.install(c) }
+        expect(v == 1)
+    }
+
+    /// The real-world case: a worker thread is parked in open() waiting for a macOS privacy prompt and never returns.
+    func stopReleasesACallerWhoseWorkIsBlockedForever() async {
+        let g = ResultGate<String>()
+        let flag = ScanProgress()
+        g.watch(stop: { flag.isCancelled }, partial: { "partial" })
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { flag.cancel() }
+        let t = Date()
+        let v = await withCheckedContinuation { (c: CheckedContinuation<String, Never>) in g.install(c) }   // the worker never calls finish
+        expect(v == "partial")
+        expect(Date().timeIntervalSince(t) < 2, "took \(Date().timeIntervalSince(t))s")
+    }
+
+    func spaceLensReturnsAtOnceWhenAlreadyStopped() async throws {
+        let root = try tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let p = ScanProgress()
+        p.cancel()
+        let t = Date()
+        let node = await SpaceLensScanner.scan(root: root, progress: p)
+        expect(Date().timeIntervalSince(t) < 2)
+        expect(node.children.isEmpty)
+    }
+}
+
 struct CatalogTests {
     func categoriesAreUniqueAndReviewOnesAreRecoverable() {
         let ids = JunkCatalog.all.map(\.id)
@@ -248,8 +348,33 @@ struct MonitorTests {
     }
 }
 
+/// `AetherCheck --bench`: how long the scanners take on this Mac's real folders.
+func bench() async {
+    func secs(_ t: Date) -> String { String(format: "%.1fs", Date().timeIntervalSince(t)) }
+    let home = FileManager.default.homeDirectoryForCurrentUser
+
+    setvbuf(stdout, nil, _IOLBF, 0)
+    var t = Date()
+    var p = ScanProgress()
+    let ticker = Task {   // live progress, so a slow or blocked scan is visible
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(3))
+            let s = p.snapshot
+            print("  ... \(secs(t)) \(s.files.formatted()) items \(Bytes.string(s.bytes)) \(s.current)")
+        }
+    }
+    defer { ticker.cancel() }
+    let tree = await SpaceLensScanner.scan(root: home, progress: p)
+    print("Space Lens (home):  \(p.snapshot.files.formatted()) items, \(Bytes.string(tree.size)) in \(secs(t))")
+
+    t = Date(); p = ScanProgress()
+    let big = await LargeFileScanner.scan(roots: LargeFileScanner.defaultRoots, minSize: 500_000_000, progress: p)
+    print("Large files (500MB): \(p.snapshot.files.formatted()) items, \(big.count) found in \(secs(t))")
+}
+
 @main struct Runner {
     static func main() async {
+        if CommandLine.arguments.contains("--bench") { await bench(); exit(0) }
         print("RemoverTests")
         await check("protectedLocationsAreRefused") { RemoverTests().protectedLocationsAreRefused() }
         await check("childrenOfAllowedRootsAreRemovable") { RemoverTests().childrenOfAllowedRootsAreRemovable() }
@@ -268,6 +393,15 @@ struct MonitorTests {
         await check("largeFileScanCanBeStoppedAndSkipsGeneratedFolders") { try await ScannerTests().largeFileScanCanBeStoppedAndSkipsGeneratedFolders() }
         await check("duplicatesIgnoreSameSizeDifferentContent") { try await ScannerTests().duplicatesIgnoreSameSizeDifferentContent() }
         await check("hardLinksAreNotDuplicates") { try await ScannerTests().hardLinksAreNotDuplicates() }
+        print("BulkDirTests")
+        await check("entriesMatchLstatNamesTypesSizesAndDates") { try BulkDirTests().entriesMatchLstatNamesTypesSizesAndDates() }
+        await check("totalSizeMatchesAFoundationWalk") { try BulkDirTests().totalSizeMatchesAFoundationWalk() }
+        await check("bigDirectoriesSpanSeveralBuffers") { try BulkDirTests().bigDirectoriesSpanSeveralBuffers() }
+        await check("missingOrForbiddenDirectoryIsNil") { BulkDirTests().missingOrForbiddenDirectoryIsNil() }
+        print("GateTests")
+        await check("firstResultWinsAndALateListenerStillGetsIt") { await GateTests().firstResultWinsAndALateListenerStillGetsIt() }
+        await check("stopReleasesACallerWhoseWorkIsBlockedForever") { await GateTests().stopReleasesACallerWhoseWorkIsBlockedForever() }
+        await check("spaceLensReturnsAtOnceWhenAlreadyStopped") { try await GateTests().spaceLensReturnsAtOnceWhenAlreadyStopped() }
         print("CatalogTests")
         await check("categoriesAreUniqueAndReviewOnesAreRecoverable") { CatalogTests().categoriesAreUniqueAndReviewOnesAreRecoverable() }
         await check("everyLocatedJunkItemPassesTheSafetyGate") { CatalogTests().everyLocatedJunkItemPassesTheSafetyGate() }
