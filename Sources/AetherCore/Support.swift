@@ -1,0 +1,70 @@
+import Foundation
+
+public enum Bytes {
+    private static let formatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        f.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
+        return f
+    }()
+
+    /// Finder-style (base 10) size string.
+    public static func string(_ n: Int64) -> String {
+        if n <= 0 { return "Zero KB" }
+        return formatter.string(fromByteCount: n)
+    }
+}
+
+public extension URL {
+    /// Path with the home directory abbreviated to `~`.
+    var tildePath: String {
+        (path as NSString).abbreviatingWithTildeInPath
+    }
+}
+
+/// Runs `transform` over `items` with at most `limit` in flight. Result order is not preserved.
+public func boundedMap<T: Sendable, R: Sendable>(
+    _ items: [T],
+    limit: Int = max(2, ProcessInfo.processInfo.activeProcessorCount - 1),
+    _ transform: @escaping @Sendable (T) async -> R
+) async -> [R] {
+    await withTaskGroup(of: R.self) { group in
+        var iterator = items.makeIterator()
+        var results: [R] = []
+        results.reserveCapacity(items.count)
+        for _ in 0..<limit {
+            guard let next = iterator.next() else { break }
+            group.addTask { await transform(next) }
+        }
+        while let done = await group.next() {
+            results.append(done)
+            if let next = iterator.next() {
+                group.addTask { await transform(next) }
+            }
+        }
+        return results
+    }
+}
+
+/// Thread-safe counters the UI can poll while a scan is running.
+public final class ScanProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _files = 0
+    private var _bytes: Int64 = 0
+    private var _current = ""
+
+    public init() {}
+
+    public func add(files: Int = 1, bytes: Int64 = 0) {
+        lock.lock(); _files += files; _bytes += bytes; lock.unlock()
+    }
+
+    public func setCurrent(_ s: String) {
+        lock.lock(); _current = s; lock.unlock()
+    }
+
+    public var snapshot: (files: Int, bytes: Int64, current: String) {
+        lock.lock(); defer { lock.unlock() }
+        return (_files, _bytes, _current)
+    }
+}
