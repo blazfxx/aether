@@ -32,6 +32,6 @@ Aether is a Mac cleaning and care suite in Swift and SwiftUI (macOS 14+). Comman
 
 ## Releasing
 
-Not set up yet. A release should: bump `VERSION` in `Scripts/build_app.sh`, run `Scripts/build_app.sh`, zip `build/Aether.app` with
+Tag `vX.Y.Z` (matching `VERSION` in `Scripts/build_app.sh`): `.github/workflows/release.yml` builds and attaches `Aether-X.Y.Z-macos.zip`. By hand, a release is: bump `VERSION` in `Scripts/build_app.sh`, run `Scripts/build_app.sh`, zip `build/Aether.app` with
 `ditto -c -k --keepParent`, and attach it to a GitHub release (the Lantern and Erebus repos do this from a tag with a `release.yml`).
 In the Blobby Launcher, Aether is listed as "coming soon" for macOS only (`UPCOMING` in `@blob/brand`).

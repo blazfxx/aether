@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Engine checks
+        run: swift run AetherCheck
+      - name: Build the app
+        run: Scripts/build_app.sh
+      - name: Zip it
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ditto -c -k --keepParent build/Aether.app "Aether-$VERSION-macos.zip"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" Aether-*.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" Aether-*.zip --generate-notes --title "Aether ${GITHUB_REF_NAME#v}"
+          fi
