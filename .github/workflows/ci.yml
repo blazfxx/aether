@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-and-check:
-    runs-on: macos-14          # Apple silicon
+    runs-on: macos-15          # Apple silicon; Package.swift needs Swift 6 tools (macos-14 has 5.10)
     steps:
       - uses: actions/checkout@v4
       - name: Engine checks

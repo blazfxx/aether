@@ -9,7 +9,7 @@ Aether is a Mac cleaning and care suite in Swift and SwiftUI (macOS 14+). Comman
   - `swift run AetherCheck`: the engine checks (safety gate, treemap geometry, duplicate detection, catalog invariants). There is no XCTest
     in the Command Line Tools, which is why the checks are a plain executable. They must pass before any change to `AetherCore` merges.
   - `Scripts/build_app.sh` makes `build/Aether.app` (ad-hoc signed); `--install` also copies it to `/Applications`.
-- **On Linux (the VPS) you cannot compile it.** Push to `main` and read the macOS CI run (`.github/workflows/ci.yml`):
+- **On Linux (the VPS) you cannot compile it.** Push to `main` and read the macOS CI run (`.github/workflows/ci.yml`, macos-15 because `Package.swift` needs Swift 6 tools):
   `gh run list -R blazfxx/aether`, then `gh run view <id> --log-failed`.
 
 ## Layout
