@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-check:
+    runs-on: macos-14          # Apple silicon
+    steps:
+      - uses: actions/checkout@v4
+      - name: Engine checks
+        run: swift run AetherCheck
+      - name: Build the app
+        run: Scripts/build_app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Aether-macos
+          path: build/Aether.app
