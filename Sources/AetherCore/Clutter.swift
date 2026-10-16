@@ -29,21 +29,25 @@ public struct FileEntry: Identifiable, Hashable, Sendable {
 public enum LargeFileScanner {
     private static let keys: [URLResourceKey] = [
         .totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey, .isPackageKey,
-        .contentModificationDateKey, .contentAccessDateKey, .isSymbolicLinkKey,
+        .contentModificationDateKey, .contentAccessDateKey, .isSymbolicLinkKey, .isDirectoryKey,
     ]
+    /// Folders full of small generated files: never where a large file you care about lives, and slow to walk.
+    private static let skippedFolders: Set<String> = ["node_modules", "Pods", "DerivedData", "__pycache__", ".venv", "venv"]
     /// Packages we should never offer up as "large files".
     private static let protectedPackages: Set<String> = ["photoslibrary", "musiclibrary", "tvlibrary", "imovielibrary", "fcpbundle"]
 
+    /// `timeLimit` stops the walk after that many seconds and returns what was found (the progress is marked truncated).
     public static func scan(
-        roots: [URL], minSize: Int64, progress: ScanProgress
+        roots: [URL], minSize: Int64, progress: ScanProgress, timeLimit: TimeInterval? = nil
     ) async -> [FileEntry] {
-        let parts = await boundedMap(roots) { root in
-            scanOne(root: root, minSize: minSize, progress: progress)
+        let deadline = timeLimit.map { Date().addingTimeInterval($0) }
+        let parts = await boundedMap(roots, limit: max(1, roots.count)) { root in
+            scanOne(root: root, minSize: minSize, progress: progress, deadline: deadline)
         }
         return parts.flatMap { $0 }.sorted { $0.size > $1.size }
     }
 
-    private static func scanOne(root: URL, minSize: Int64, progress: ScanProgress) -> [FileEntry] {
+    private static func scanOne(root: URL, minSize: Int64, progress: ScanProgress, deadline: Date?) -> [FileEntry] {
         var out: [FileEntry] = []
         guard let walker = FileManager.default.enumerator(
             at: root, includingPropertiesForKeys: keys,
@@ -52,8 +56,18 @@ public enum LargeFileScanner {
         var n = 0
         for case let url as URL in walker {
             n += 1
-            if n & 0xFF == 0 { if Task.isCancelled { break }; progress.setCurrent(url.deletingLastPathComponent().path) }
+            if n & 0x3F == 0 {
+                if Task.isCancelled || progress.isCancelled || (deadline.map { Date() > $0 } ?? false) {
+                    progress.markTruncated()
+                    break
+                }
+                progress.setCurrent(url.deletingLastPathComponent().path)
+            }
             guard let v = try? url.resourceValues(forKeys: Set(keys)), v.isSymbolicLink != true else { continue }
+            if v.isDirectory == true, v.isPackage != true, skippedFolders.contains(url.lastPathComponent) {
+                walker.skipDescendants()
+                continue
+            }
             progress.add()
             if v.isRegularFile == true {
                 let s = Int64(v.totalFileAllocatedSize ?? v.fileAllocatedSize ?? 0)

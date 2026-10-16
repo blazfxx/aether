@@ -142,6 +142,27 @@ struct ScannerTests {
         expect(found.map(\.url.lastPathComponent) == ["huge.bin"])
     }
 
+    func largeFileScanCanBeStoppedAndSkipsGeneratedFolders() async throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A big file inside node_modules is not offered, and the walk never goes in.
+        let modules = root.appendingPathComponent("node_modules")
+        try FileManager.default.createDirectory(at: modules, withIntermediateDirectories: true)
+        try Data(repeating: 3, count: 3_000_000).write(to: modules.appendingPathComponent("big.bin"))
+        let found = await LargeFileScanner.scan(roots: [root], minSize: 2_500_000, progress: ScanProgress())
+        expect(found.map(\.url.lastPathComponent) == ["huge.bin"])
+        // A scan told to stop returns at once, and says it did not finish.
+        let stopped = ScanProgress()
+        stopped.cancel()
+        for i in 0..<300 { try Data().write(to: root.appendingPathComponent("f\(i).txt")) }
+        _ = await LargeFileScanner.scan(roots: [root], minSize: 2_500_000, progress: stopped)
+        expect(stopped.wasTruncated)
+        // An expired time limit does the same.
+        let late = ScanProgress()
+        _ = await LargeFileScanner.scan(roots: [root], minSize: 2_500_000, progress: late, timeLimit: -1)
+        expect(late.wasTruncated)
+    }
+
     func duplicatesIgnoreSameSizeDifferentContent() async throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -244,6 +265,7 @@ struct MonitorTests {
         print("ScannerTests")
         await check("spaceLensSizesAddUp") { try await ScannerTests().spaceLensSizesAddUp() }
         await check("largeFileScanRespectsThreshold") { try await ScannerTests().largeFileScanRespectsThreshold() }
+        await check("largeFileScanCanBeStoppedAndSkipsGeneratedFolders") { try await ScannerTests().largeFileScanCanBeStoppedAndSkipsGeneratedFolders() }
         await check("duplicatesIgnoreSameSizeDifferentContent") { try await ScannerTests().duplicatesIgnoreSameSizeDifferentContent() }
         await check("hardLinksAreNotDuplicates") { try await ScannerTests().hardLinksAreNotDuplicates() }
         print("CatalogTests")

@@ -49,6 +49,26 @@ private struct ScanSteps: View {
                     }
                 }
             }
+            if model.current == .large {
+                // Walking a big home folder takes a while, and macOS may be waiting for you to allow access to a folder.
+                TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+                    let p = model.largeProgress.snapshot
+                    VStack(spacing: 8) {
+                        Text("\(p.files.formatted()) files checked")
+                            .font(.callout).foregroundStyle(.white.opacity(0.75))
+                        if !p.current.isEmpty {
+                            Text(p.current).font(.caption).lineLimit(1).truncationMode(.middle)
+                                .foregroundStyle(.white.opacity(0.45)).frame(maxWidth: 420)
+                        } else {
+                            Text("If macOS asks for access to a folder, choose Allow.")
+                                .font(.caption).foregroundStyle(.white.opacity(0.6))
+                        }
+                        Button("Skip large files") { model.largeProgress.cancel() }
+                            .buttonStyle(.plain).font(.callout).foregroundStyle(.white.opacity(0.85))
+                            .padding(.top, 4)
+                    }
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -77,7 +97,7 @@ private struct SmartResults: View {
                               detail: "Browser history, cookies and recent-item traces.",
                               value: privacy.groups.isEmpty ? "None" : Bytes.string(privacy.totalFound), button: "Review") { state.selection = .privacy }
                     ResultRow(module: .largeFiles, title: "Large Files",
-                              detail: model.largeCount == 0 ? "No files over 500 MB in your main folders." : "\(model.largeCount) file\(model.largeCount == 1 ? "" : "s") over 500 MB.",
+                              detail: model.largePartial ? "Only part of your folders was checked: \(model.largeCount) file\(model.largeCount == 1 ? "" : "s") over 500 MB so far. Review scans the rest." : model.largeCount == 0 ? "No files over 500 MB in your main folders." : "\(model.largeCount) file\(model.largeCount == 1 ? "" : "s") over 500 MB.",
                               value: Bytes.string(model.largeBytes), button: "Review") { state.selection = .largeFiles }
                     ResultRow(module: .startup, title: "Startup Items",
                               detail: model.unsignedStartup > 0 ? "\(model.unsignedStartup) background item\(model.unsignedStartup == 1 ? " is" : "s are") not code-signed." : "All background items are signed.",

@@ -52,8 +52,19 @@ public final class ScanProgress: @unchecked Sendable {
     private var _files = 0
     private var _bytes: Int64 = 0
     private var _current = ""
+    private var _cancelled = false
+    private var _truncated = false
 
     public init() {}
+
+    /// Asks the scan using this to stop early and return what it has found so far.
+    public func cancel() { lock.lock(); _cancelled = true; lock.unlock() }
+    public var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return _cancelled }
+    /// Set by a scan that stopped before it finished (cancelled or out of time).
+    public func markTruncated() { lock.lock(); _truncated = true; lock.unlock() }
+    public var wasTruncated: Bool { lock.lock(); defer { lock.unlock() }; return _truncated }
+
+    public func reset() { lock.lock(); _files = 0; _bytes = 0; _current = ""; _cancelled = false; _truncated = false; lock.unlock() }
 
     public func add(files: Int = 1, bytes: Int64 = 0) {
         lock.lock(); _files += files; _bytes += bytes; lock.unlock()

@@ -566,14 +566,16 @@ struct HealthIssue: Identifiable {
     var summary: RemovalSummary?
 
     let junk: JunkModel, privacy: PrivacyModel, large: LargeFilesModel, startup: StartupModel
-    private let largeProgress = ScanProgress()
+    let largeProgress = ScanProgress()
+    var largePartial = false
 
     init(junk: JunkModel, privacy: PrivacyModel, large: LargeFilesModel, startup: StartupModel) {
         self.junk = junk; self.privacy = privacy; self.large = large; self.startup = startup
     }
 
     func run() {
-        phase = .scanning; completed = []; summary = nil
+        phase = .scanning; completed = []; summary = nil; largePartial = false
+        largeProgress.reset()
         Task {
             current = .junk
             let r = await JunkScanner.scan()
@@ -588,7 +590,9 @@ struct HealthIssue: Identifiable {
             completed.insert(.privacy)
 
             current = .large
-            let found = await LargeFileScanner.scan(roots: LargeFileScanner.defaultRoots, minSize: 500_000_000, progress: largeProgress)
+            // A big home folder can take many minutes to walk; Smart Scan gives it 45 seconds, or until Skip is pressed.
+            let found = await LargeFileScanner.scan(roots: LargeFileScanner.defaultRoots, minSize: 500_000_000, progress: largeProgress, timeLimit: 45)
+            largePartial = largeProgress.wasTruncated
             largeCount = found.count; largeBytes = found.reduce(0) { $0 + $1.size }
             completed.insert(.large)
 
