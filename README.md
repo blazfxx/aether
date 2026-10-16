@@ -48,7 +48,7 @@ swift run AetherCheck
 Sources/AetherCore    scanning, sizing, safety gate, system sampling (no UI)
 Sources/Aether        SwiftUI app: theme, models, one view file per section
 Sources/AetherCheck   engine checks
-Scripts/              build_app.sh, make_icon.swift
+Scripts/              build_app.sh, render-icon.mjs (the icon is Resources/AppIcon.svg)
 ```
 
 ## Permissions

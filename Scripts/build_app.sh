@@ -19,12 +19,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Aether"
 
-if [ ! -f "$ROOT/build/AppIcon.icns" ]; then
-  echo "› rendering icon"
-  rm -rf "$ROOT/build/AppIcon.iconset"
-  swift "$ROOT/Scripts/make_icon.swift" "$ROOT/build/AppIcon.iconset" >/dev/null
-  iconutil -c icns "$ROOT/build/AppIcon.iconset" -o "$ROOT/build/AppIcon.icns"
-fi
+# The icon is drawn in Resources/AppIcon.svg and rendered into Resources/AppIcon.iconset (Scripts/render-icon.mjs).
+mkdir -p "$ROOT/build"
+iconutil -c icns "$ROOT/Resources/AppIcon.iconset" -o "$ROOT/build/AppIcon.icns"
 cp "$ROOT/build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
