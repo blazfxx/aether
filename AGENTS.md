@@ -25,10 +25,27 @@ Aether is a Mac cleaning and care suite in Swift and SwiftUI (macOS 14+). Comman
 
 ## Rules for changes
 
-- No network code. Nothing is uploaded.
+- Network use is limited to downloads that ask whether something newer exists: Aether's own releases on GitHub (`ReleaseFeed`),
+  and other apps' versions from the App Store lookup or the app's own Sparkle feed (`AppUpdateChecker`). Never send anything about the
+  user's files, folders or Mac, and never add other network calls. HTTPS only; no cookies.
 - Items flagged Review start unselected; orphaned-leftover matches are never preselected.
 - Some locations need Full Disk Access; show the banner rather than failing silently. Admin tasks use the standard macOS password prompt.
 - Add a check to `AetherCheck` for every new rule in `Remover` or the catalog.
+
+## Updates
+
+- `SelfUpdater` (app) checks GitHub at launch and every 4 hours, downloads `Aether-X.Y.Z-macos.zip`, and `UpdateInstaller.stage` refuses anything that is
+  not Aether (bundle ID), not the announced version, or has an invalid code signature. It also checks `<zip>.sha256` when the release has one.
+  The swap runs in a separate `sh` after Aether quits and restores the old copy if it fails. Only copies in `/Applications` or `~/Applications`
+  replace themselves; a developer build never does.
+- Releases must stay named `Aether-X.Y.Z-macos.zip` with `Aether.app` at the top level, or the updater won't find them.
+- To test the updater end to end: `AETHER_VERSION=1.0.0 Scripts/build_app.sh`, copy the app into `~/Applications`, launch it.
+- The Uninstaller's Updates tab only *opens* the App Store page or the vendor's download; Aether never installs other apps' updates.
+
+## Remembered choices
+
+`SelectionMemory` stores what the user ticked or unticked (by path) so the next scan starts the same way. Every screen that offers
+tick boxes for removable items should go through it, and "clean safe items" paths must respect it.
 
 ## Scanning rules (learned the hard way)
 

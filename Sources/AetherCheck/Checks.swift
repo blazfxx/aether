@@ -17,6 +17,12 @@ func expect(_ cond: @autoclosure () -> Bool, _ msg: String = "", line: Int = #li
     if !cond() { failures += 1; print("    FAIL line \(line) \(msg)") }
 }
 
+/// Like `expect`, for conditions that call throwing code.
+func expectT(_ cond: @autoclosure () throws -> Bool, _ msg: String = "", line: Int = #line) throws {
+    checks += 1
+    if !(try cond()) { failures += 1; print("    FAIL line \(line) \(msg)") }
+}
+
 private let home = FileManager.default.homeDirectoryForCurrentUser
 
 private func tempDir(in base: URL = FileManager.default.temporaryDirectory) throws -> URL {
@@ -283,6 +289,278 @@ struct GateTests {
     }
 }
 
+struct VersionTests {
+    func comparesNumericallyNotAlphabetically() {
+        expect(AppVersion("1.10") > AppVersion("1.9"))
+        expect(AppVersion("1.0.2") > AppVersion("1.0.1"))
+        expect(AppVersion("2") == AppVersion("2.0.0"))
+        expect(AppVersion("v2.1") == AppVersion("2.1"))
+        expect(AppVersion("1.0-beta") == AppVersion("1.0"))
+        expect(AppVersion("10.0") > AppVersion("9.99.99"))
+        expect(!AppVersion("abc").isValid)
+        expect(AppVersion("3.0b1").isValid)
+    }
+}
+
+struct SelectionMemoryTests {
+    private func fresh() -> (SelectionMemory, UserDefaults, String) {
+        let name = "aether-test-\(UUID().uuidString)"
+        let d = UserDefaults(suiteName: name)!
+        return (SelectionMemory(defaults: d), d, name)
+    }
+
+    func untickedItemsStayUntickedNextTime() {
+        let (m, d, name) = fresh()
+        defer { d.removePersistentDomain(forName: name) }
+        let cache = URL(fileURLWithPath: "/Users/x/Library/Caches/com.example.app")
+        expect(m.isSelected(cache, default: true))                 // never touched: default
+        m.set(cache, selected: false)
+        expect(!m.isSelected(cache, default: true))                // remembered
+        let reborn = SelectionMemory(defaults: d)                  // next launch
+        expect(!reborn.isSelected(cache, default: true))
+    }
+
+    func reviewItemsYouTickedStayTicked() {
+        let (m, d, name) = fresh()
+        defer { d.removePersistentDomain(forName: name) }
+        let installer = URL(fileURLWithPath: "/Users/x/Downloads/Thing.dmg")
+        expect(!m.isSelected(installer, default: false))
+        m.set(installer, selected: true)
+        expect(m.isSelected(installer, default: false))
+    }
+
+    func forgetAllRestoresDefaults() {
+        let (m, d, name) = fresh()
+        defer { d.removePersistentDomain(forName: name) }
+        let u = URL(fileURLWithPath: "/tmp/a")
+        m.set(u, selected: false)
+        m.forgetAll()
+        expect(m.isSelected(u, default: true))
+        expect(m.count == 0)
+    }
+
+    func theListStaysBounded() {
+        let (m, d, name) = fresh()
+        defer { d.removePersistentDomain(forName: name) }
+        let urls = (0..<4_500).map { URL(fileURLWithPath: "/tmp/item-\($0)") }
+        m.set(urls, selected: false)
+        expect(m.count <= 4_000, "\(m.count)")
+        expect(m.choice(for: urls.last!) == false)     // newest kept
+        expect(m.choice(for: urls.first!) == nil)      // oldest dropped
+    }
+}
+
+struct UpdateFeedTests {
+    private func json(tag: String = "v1.2.3", draft: Bool = false, pre: Bool = false, assets: [(String, String)]) -> Data {
+        let a = assets.map { "{\"name\":\"\($0.0)\",\"browser_download_url\":\"\($0.1)\"}" }.joined(separator: ",")
+        return Data("{\"tag_name\":\"\(tag)\",\"draft\":\(draft),\"prerelease\":\(pre),\"html_url\":\"https://github.com/blazfxx/aether/releases/tag/\(tag)\",\"body\":\"notes\",\"assets\":[\(a)]}".utf8)
+    }
+
+    func parsesTheRealReleaseShape() throws {
+        let r = try ReleaseFeed.parse(json(assets: [
+            ("Aether-1.2.3-macos.zip", "https://github.com/blazfxx/aether/releases/download/v1.2.3/Aether-1.2.3-macos.zip"),
+            ("Aether-1.2.3-macos.zip.sha256", "https://github.com/blazfxx/aether/releases/download/v1.2.3/Aether-1.2.3-macos.zip.sha256"),
+        ]))
+        expect(r?.version == "1.2.3")
+        expect(r?.zipName == "Aether-1.2.3-macos.zip")
+        expect(r?.checksumURL?.lastPathComponent == "Aether-1.2.3-macos.zip.sha256")
+        expect(r?.notes == "notes")
+    }
+
+    func ignoresDraftsPrereleasesAndReleasesWithoutAMacZip() throws {
+        let zip = [("Aether-1.2.3-macos.zip", "https://example.com/a.zip")]
+        try expectT(ReleaseFeed.parse(json(draft: true, assets: zip)) == nil)
+        try expectT(ReleaseFeed.parse(json(pre: true, assets: zip)) == nil)
+        try expectT(ReleaseFeed.parse(json(assets: [("source.tar.gz", "https://example.com/s.tgz")])) == nil)
+    }
+
+    func refusesPlainHTTPDownloads() throws {
+        try expectT(ReleaseFeed.parse(json(assets: [("Aether-1.2.3-macos.zip", "http://example.com/a.zip")])) == nil)
+    }
+
+    func rejectsGarbage() {
+        var threw = false
+        do { _ = try ReleaseFeed.parse(Data("not json".utf8)) } catch { threw = true }
+        expect(threw)
+    }
+}
+
+struct UpdateInstallTests {
+    /// A tiny ad-hoc-signed app that stands in for a downloaded Aether.
+    private func fakeApp(in dir: URL, id: String = UpdateInstaller.bundleID, version: String = "9.9.9", sign: Bool = true) throws -> URL {
+        let app = dir.appendingPathComponent("Aether.app")
+        let macos = app.appendingPathComponent("Contents/MacOS")
+        try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: "/usr/bin/true"), to: macos.appendingPathComponent("Aether"))
+        let plist: [String: Any] = ["CFBundleIdentifier": id, "CFBundleShortVersionString": version, "CFBundleExecutable": "Aether",
+                                    "CFBundlePackageType": "APPL", "CFBundleName": "Aether"]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: app.appendingPathComponent("Contents/Info.plist"))
+        if sign { expect(runStatus("/usr/bin/codesign", ["--force", "--sign", "-", app.path]) == 0, "codesign") }
+        return app
+    }
+
+    private func zip(_ app: URL, to dir: URL) throws -> URL {
+        let z = dir.appendingPathComponent("update.zip")
+        expect(runStatus("/usr/bin/ditto", ["-c", "-k", "--keepParent", app.path, z.path]) == 0)
+        return z
+    }
+
+    private func rejects(_ build: (URL) throws -> URL, version: String = "9.9.9") throws -> Bool {
+        let root = try tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let src = root.appendingPathComponent("src"), work = root.appendingPathComponent("work")
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        let z = try build(src)
+        do { _ = try UpdateInstaller.stage(zip: z, version: version, workDir: work); return false } catch { return true }
+    }
+
+    func acceptsAValidSignedAetherBundle() throws {
+        let root = try tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let src = root.appendingPathComponent("src")
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        let z = try zip(try fakeApp(in: src), to: root)
+        let staged = try UpdateInstaller.stage(zip: z, version: "9.9.9", workDir: root.appendingPathComponent("work"))
+        expect(staged.pathExtension == "app")
+        expect(Bundle(url: staged)?.bundleIdentifier == UpdateInstaller.bundleID)
+    }
+
+    func rejectsAnotherApp() throws {
+        try expectT(rejects { src in try zip(try fakeApp(in: src, id: "com.evil.Other"), to: src.deletingLastPathComponent()) })
+    }
+
+    func rejectsTheWrongVersion() throws {
+        try expectT(rejects { src in try zip(try fakeApp(in: src, version: "1.0.0"), to: src.deletingLastPathComponent()) })
+    }
+
+    func rejectsAnUnsignedBundle() throws {
+        try expectT(rejects { src in try zip(try fakeApp(in: src, sign: false), to: src.deletingLastPathComponent()) })
+    }
+
+    func rejectsABundleTamperedWithAfterSigning() throws {
+        try expectT(rejects { src in
+            let app = try fakeApp(in: src)
+            let exe = app.appendingPathComponent("Contents/MacOS/Aether")
+            let h = try FileHandle(forWritingTo: exe)
+            try h.seekToEnd(); try h.write(contentsOf: Data("malicious".utf8)); try h.close()
+            return try zip(app, to: src.deletingLastPathComponent())
+        })
+    }
+
+    func rejectsAZipThatIsNotAnApp() throws {
+        try expectT(rejects { src in
+            let junk = src.appendingPathComponent("hello.txt")
+            try Data("hi".utf8).write(to: junk)
+            let z = src.deletingLastPathComponent().appendingPathComponent("update.zip")
+            _ = runStatus("/usr/bin/ditto", ["-c", "-k", "--keepParent", junk.path, z.path])
+            return z
+        })
+    }
+
+    func onlyApplicationsFoldersReplaceThemselves() {
+        expect(!UpdateInstaller.canReplace(URL(fileURLWithPath: "/Users/someone/Developer/Aether/build/Aether.app")))
+        expect(!UpdateInstaller.canReplace(URL(fileURLWithPath: "/Users/someone/Desktop/Aether.app")))
+        expect(!UpdateInstaller.canReplace(URL(fileURLWithPath: "/Applications/Aether")))   // not a bundle
+    }
+
+    func swapReplacesTheTargetEvenWithSpacesInPaths() throws {
+        let root = try tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("My Apps/Aether.app")
+        let staged = root.appendingPathComponent("new stuff/Aether.app")
+        for (dir, marker) in [(target, "old"), (staged, "new")] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data(marker.utf8).write(to: dir.appendingPathComponent("marker"))
+        }
+        let p = UpdateInstaller.spawnSwap(pid: 999_999, staged: staged, target: target, relaunch: false)
+        p?.waitUntilExit()
+        expect(p?.terminationStatus == 0)
+        expect((try? String(contentsOf: target.appendingPathComponent("marker"), encoding: .utf8)) == "new")
+        expect(!FileManager.default.fileExists(atPath: staged.path))
+        let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: target.deletingLastPathComponent().path)) ?? []
+        expect(leftovers == ["Aether.app"], "\(leftovers)")   // no .old backup left behind
+    }
+
+    func aFailedSwapRestoresTheOldApp() throws {
+        let root = try tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("Aether.app")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: target.appendingPathComponent("marker"))
+        let missing = root.appendingPathComponent("does-not-exist.app")
+        UpdateInstaller.spawnSwap(pid: 999_999, staged: missing, target: target, relaunch: false)?.waitUntilExit()
+        expect((try? String(contentsOf: target.appendingPathComponent("marker"), encoding: .utf8)) == "old")
+    }
+}
+
+struct AppUpdateTests {
+    private let appcast = Data("""
+    <?xml version="1.0"?>
+    <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+    <item><title>2.1</title><sparkle:version>210</sparkle:version><sparkle:shortVersionString>2.1</sparkle:shortVersionString>
+      <enclosure url="https://x.test/App-2.1.zip" sparkle:version="210"/></item>
+    <item><title>3.0 beta</title><sparkle:channel>beta</sparkle:channel><sparkle:version>300</sparkle:version><sparkle:shortVersionString>3.0b1</sparkle:shortVersionString></item>
+    <item><title>2.5</title><sparkle:version>250</sparkle:version><sparkle:shortVersionString>2.5</sparkle:shortVersionString><sparkle:minimumSystemVersion>99.0</sparkle:minimumSystemVersion></item>
+    <item><title>2.0</title><enclosure url="https://x.test/App-2.0.zip" sparkle:shortVersionString="2.0" sparkle:version="200"/></item>
+    </channel></rss>
+    """.utf8)
+
+    func picksTheNewestStableItemThisMacCanRun() {
+        let items = AppUpdateChecker.parseAppcast(appcast)
+        expect(items.count == 4)
+        let now = AppUpdateChecker.newest(in: items, osVersion: AppVersion("15.0"))
+        expect(now?.shortVersion == "2.1", "\(now?.shortVersion ?? "nil")")   // not the beta, not the one needing macOS 99
+        expect(now?.download?.absoluteString == "https://x.test/App-2.1.zip")
+        let future = AppUpdateChecker.newest(in: items, osVersion: AppVersion("99.0"))
+        expect(future?.shortVersion == "2.5")
+    }
+
+    func emptyOrBrokenFeedsGiveNothing() {
+        expect(AppUpdateChecker.newest(in: AppUpdateChecker.parseAppcast(Data("<rss></rss>".utf8)), osVersion: AppVersion("15.0")) == nil)
+        expect(AppUpdateChecker.newest(in: AppUpdateChecker.parseAppcast(Data("garbage".utf8)), osVersion: AppVersion("15.0")) == nil)
+    }
+
+    func readsAnAppStoreLookup() {
+        let ok = AppUpdateChecker.parseLookup(Data("{\"resultCount\":1,\"results\":[{\"version\":\"4.2.1\",\"trackId\":12345}]}".utf8))
+        expect(ok?.version == "4.2.1" && ok?.trackID == 12345)
+        expect(AppUpdateChecker.parseLookup(Data("{\"resultCount\":0,\"results\":[]}".utf8)) == nil)
+        expect(AppUpdateChecker.lookupURL(bundleID: "com.x.y", country: "us")?.absoluteString.contains("bundleId=com.x.y") == true)
+    }
+
+    func theAppStoreButtonOpensTheStore() {
+        let app = AppInfo(url: URL(fileURLWithPath: "/Applications/X.app"), name: "X", bundleID: "com.x", version: "1", size: 0, lastUsed: nil, fromAppStore: true)
+        let u = AppUpdate(app: app, installed: "1", latest: "2", source: .appStore(trackID: 42))
+        expect(u.openURL?.absoluteString == "macappstore://apps.apple.com/app/id42")
+    }
+}
+
+struct AdvisorTests {
+    func memoryAdviceNeedsRealPressure() {
+        expect(MaintenanceAdvisor.purgeAdvice(memoryPressure: 0.95) != nil)
+        expect(MaintenanceAdvisor.purgeAdvice(memoryPressure: 0.30) == nil)
+    }
+
+    func spotlightIsOnlyBlamedWhenItIsOnAndEmpty() {
+        let on = "/System/Volumes/Data:\n\tIndexing enabled. "
+        let off = "/:\n\tIndexing disabled."
+        expect(MaintenanceAdvisor.spotlightVerdict(appCount: 54, volumeStatus: on) == nil)        // finds apps: healthy
+        expect(MaintenanceAdvisor.spotlightVerdict(appCount: 0, volumeStatus: off) == nil)        // switched off on purpose
+        expect(MaintenanceAdvisor.spotlightVerdict(appCount: 0, volumeStatus: on) != nil)         // on but empty: broken
+        expect(MaintenanceAdvisor.spotlightVerdict(appCount: 0, volumeStatus: nil) == nil)        // can't tell: say nothing
+        expect(MaintenanceAdvisor.spotlightVerdict(appCount: nil, volumeStatus: on) == nil)
+    }
+
+    func everyRecommendationIsARealTaskWithAReason() async {
+        let advice = await MaintenanceAdvisor.recommend(memoryPressure: 0.99)
+        expect(advice.contains { $0.task.id == "purge" })
+        let known = Set(Maintenance.tasks.map(\.id))
+        for a in advice { expect(known.contains(a.task.id) && !a.reason.isEmpty, a.task.id) }
+        // Rebuilding Launch Services and Quick Look have no cheap test, so they are never suggested on their own.
+        expect(!advice.contains { $0.task.id == "launchservices" || $0.task.id == "quicklook" })
+    }
+}
+
 struct CatalogTests {
     func categoriesAreUniqueAndReviewOnesAreRecoverable() {
         let ids = JunkCatalog.all.map(\.id)
@@ -370,6 +648,18 @@ func bench() async {
     t = Date(); p = ScanProgress()
     let big = await LargeFileScanner.scan(roots: LargeFileScanner.defaultRoots, minSize: 500_000_000, progress: p)
     print("Large files (500MB): \(p.snapshot.files.formatted()) items, \(big.count) found in \(secs(t))")
+
+    t = Date()
+    let apps = await AppScanner.scan()
+    let updates = await AppUpdateChecker.check(apps)
+    print("App updates:        \(apps.count) apps checked, \(updates.count) with updates in \(secs(t))")
+    for u in updates { print("  \(u.app.name): \(u.installed) -> \(u.latest)  [\(u.sourceName)]") }
+
+    t = Date()
+    let pressure = SystemSampler().sample().memory.pressure
+    let advice = await MaintenanceAdvisor.recommend(memoryPressure: pressure)
+    print("Maintenance:        memory \(Int(pressure * 100))% in use; \(advice.count) recommended in \(secs(t))")
+    for a in advice { print("  \(a.task.title): \(a.reason)") }
 }
 
 @main struct Runner {
@@ -402,6 +692,37 @@ func bench() async {
         await check("firstResultWinsAndALateListenerStillGetsIt") { await GateTests().firstResultWinsAndALateListenerStillGetsIt() }
         await check("stopReleasesACallerWhoseWorkIsBlockedForever") { await GateTests().stopReleasesACallerWhoseWorkIsBlockedForever() }
         await check("spaceLensReturnsAtOnceWhenAlreadyStopped") { try await GateTests().spaceLensReturnsAtOnceWhenAlreadyStopped() }
+        print("VersionTests")
+        await check("comparesNumericallyNotAlphabetically") { VersionTests().comparesNumericallyNotAlphabetically() }
+        print("SelectionMemoryTests")
+        await check("untickedItemsStayUntickedNextTime") { SelectionMemoryTests().untickedItemsStayUntickedNextTime() }
+        await check("reviewItemsYouTickedStayTicked") { SelectionMemoryTests().reviewItemsYouTickedStayTicked() }
+        await check("forgetAllRestoresDefaults") { SelectionMemoryTests().forgetAllRestoresDefaults() }
+        await check("theListStaysBounded") { SelectionMemoryTests().theListStaysBounded() }
+        print("UpdateFeedTests")
+        await check("parsesTheRealReleaseShape") { try UpdateFeedTests().parsesTheRealReleaseShape() }
+        await check("ignoresDraftsPrereleasesAndReleasesWithoutAMacZip") { try UpdateFeedTests().ignoresDraftsPrereleasesAndReleasesWithoutAMacZip() }
+        await check("refusesPlainHTTPDownloads") { try UpdateFeedTests().refusesPlainHTTPDownloads() }
+        await check("rejectsGarbage") { UpdateFeedTests().rejectsGarbage() }
+        print("UpdateInstallTests")
+        await check("acceptsAValidSignedAetherBundle") { try UpdateInstallTests().acceptsAValidSignedAetherBundle() }
+        await check("rejectsAnotherApp") { try UpdateInstallTests().rejectsAnotherApp() }
+        await check("rejectsTheWrongVersion") { try UpdateInstallTests().rejectsTheWrongVersion() }
+        await check("rejectsAnUnsignedBundle") { try UpdateInstallTests().rejectsAnUnsignedBundle() }
+        await check("rejectsABundleTamperedWithAfterSigning") { try UpdateInstallTests().rejectsABundleTamperedWithAfterSigning() }
+        await check("rejectsAZipThatIsNotAnApp") { try UpdateInstallTests().rejectsAZipThatIsNotAnApp() }
+        await check("onlyApplicationsFoldersReplaceThemselves") { UpdateInstallTests().onlyApplicationsFoldersReplaceThemselves() }
+        await check("swapReplacesTheTargetEvenWithSpacesInPaths") { try UpdateInstallTests().swapReplacesTheTargetEvenWithSpacesInPaths() }
+        await check("aFailedSwapRestoresTheOldApp") { try UpdateInstallTests().aFailedSwapRestoresTheOldApp() }
+        print("AppUpdateTests")
+        await check("picksTheNewestStableItemThisMacCanRun") { AppUpdateTests().picksTheNewestStableItemThisMacCanRun() }
+        await check("emptyOrBrokenFeedsGiveNothing") { AppUpdateTests().emptyOrBrokenFeedsGiveNothing() }
+        await check("readsAnAppStoreLookup") { AppUpdateTests().readsAnAppStoreLookup() }
+        await check("theAppStoreButtonOpensTheStore") { AppUpdateTests().theAppStoreButtonOpensTheStore() }
+        print("AdvisorTests")
+        await check("memoryAdviceNeedsRealPressure") { AdvisorTests().memoryAdviceNeedsRealPressure() }
+        await check("spotlightIsOnlyBlamedWhenItIsOnAndEmpty") { AdvisorTests().spotlightIsOnlyBlamedWhenItIsOnAndEmpty() }
+        await check("everyRecommendationIsARealTaskWithAReason") { await AdvisorTests().everyRecommendationIsARealTaskWithAReason() }
         print("CatalogTests")
         await check("categoriesAreUniqueAndReviewOnesAreRecoverable") { CatalogTests().categoriesAreUniqueAndReviewOnesAreRecoverable() }
         await check("everyLocatedJunkItemPassesTheSafetyGate") { CatalogTests().everyLocatedJunkItemPassesTheSafetyGate() }

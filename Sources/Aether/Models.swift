@@ -4,6 +4,17 @@ import AetherCore
 
 enum Phase: Equatable { case idle, scanning, results, working, done }
 
+/// UserDefaults keys shared by Settings (`@AppStorage`) and the code that reads them.
+enum Prefs {
+    static let autoCheckUpdates = "autoCheckUpdates"
+    static let autoInstallUpdates = "autoInstallUpdates"
+    static let checkAppUpdates = "checkAppUpdates"
+
+    static func bool(_ key: String, default fallback: Bool) -> Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? fallback
+    }
+}
+
 // MARK: - Junk
 
 @MainActor @Observable final class JunkModel {
@@ -14,14 +25,30 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
     var scanLabel = "Looking for junk"
     var summary = RemovalSummary()
     private var task: Task<Void, Never>?
+    private let memory = SelectionMemory.shared
 
     var visible: [JunkResult] { results.filter { !$0.items.isEmpty } }
     var totalFound: Int64 { results.reduce(0) { $0 + $1.total } }
     var selectedBytes: Int64 { results.flatMap(\.items).filter { selected.contains($0.url) }.reduce(0) { $0 + $1.size } }
     var safeBytes: Int64 { results.filter { $0.category.risk == .safe }.reduce(0) { $0 + $1.total } }
+    /// What Smart Scan's one-click clean may delete: safe categories only, minus anything you unticked.
+    var safeSelectedBytes: Int64 {
+        results.filter { $0.category.risk == .safe }.flatMap(\.items).filter { selected.contains($0.url) }.reduce(0) { $0 + $1.size }
+    }
     /// Categories that came back empty only because macOS blocked the read.
     func blockedCategories(hasFDA: Bool) -> [JunkCategory] {
         hasFDA ? [] : results.filter { $0.category.needsFullDiskAccess && $0.items.isEmpty }.map(\.category)
+    }
+
+    /// Takes fresh scan results and starts from what you chose last time. Items you never touched follow
+    /// the category default (safe ones on, review ones off).
+    func apply(_ r: [JunkResult]) {
+        results = r
+        selected = Set(r.flatMap { res in
+            res.items.filter { memory.isSelected($0.url, default: res.category.risk == .safe) }.map(\.url)
+        })
+        focused = visible.first?.category.id
+        phase = .results
     }
 
     func scan() {
@@ -31,10 +58,7 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
                 Task { @MainActor in self?.scanLabel = "Checking \(name)" }
             }
             guard !Task.isCancelled else { return }
-            results = r
-            selected = Set(r.filter { $0.category.risk == .safe }.flatMap(\.items).map(\.url))
-            focused = visible.first?.category.id
-            phase = .results
+            apply(r)
         }
     }
 
@@ -46,22 +70,34 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
     }
 
     func toggle(_ r: JunkResult) {
-        if state(for: r) == .on { r.items.forEach { selected.remove($0.url) } }
-        else { r.items.forEach { selected.insert($0.url) } }
+        let turnOn = state(for: r) != .on
+        if turnOn { r.items.forEach { selected.insert($0.url) } } else { r.items.forEach { selected.remove($0.url) } }
+        memory.set(r.items.map(\.url), selected: turnOn)
     }
 
     func toggle(_ item: JunkItem) {
-        if selected.contains(item.url) { selected.remove(item.url) } else { selected.insert(item.url) }
+        let turnOn = !selected.contains(item.url)
+        if turnOn { selected.insert(item.url) } else { selected.remove(item.url) }
+        memory.set(item.url, selected: turnOn)
     }
 
-    /// `safeOnly` is the menu bar / Smart Scan path: never touches anything flagged for review.
-    func clean(safeOnly: Bool = false) {
+    func clean() {
+        let (perm, trash) = selection(safeOnly: false)
+        run(perm: perm, trash: trash)
+    }
+
+    /// Selected items, split by how they are removed. `safeOnly` keeps to categories that regenerate on their own.
+    func selection(safeOnly: Bool) -> (perm: [(URL, Int64)], trash: [(URL, Int64)]) {
         var perm: [(URL, Int64)] = [], trash: [(URL, Int64)] = []
         for r in results where !safeOnly || r.category.risk == .safe {
-            for i in r.items where safeOnly || selected.contains(i.url) {
+            for i in r.items where selected.contains(i.url) {
                 if r.category.mode == .permanent { perm.append((i.url, i.size)) } else { trash.append((i.url, i.size)) }
             }
         }
+        return (perm, trash)
+    }
+
+    func run(perm: [(URL, Int64)], trash: [(URL, Int64)]) {
         phase = .working
         Task {
             let s = await Task.detached(priority: .userInitiated) { Remover.execute(permanent: perm, trash: trash) }.value
@@ -80,18 +116,27 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
     var groups: [PrivacyGroup] = []
     var selected: Set<URL> = []
     var summary = RemovalSummary()
+    private let memory = SelectionMemory.shared
 
     var totalFound: Int64 { groups.reduce(0) { $0 + $1.total } }
     var selectedBytes: Int64 { groups.filter { $0.blockedBy == nil }.flatMap(\.items).filter { selected.contains($0.url) }.reduce(0) { $0 + $1.size } }
 
+    /// Shell history is useful to most people, so by default it starts unselected; everything else starts selected.
+    /// Anything you ticked or unticked before keeps that state.
+    func apply(_ g: [PrivacyGroup]) {
+        groups = g
+        selected = Set(g.flatMap { group in
+            group.items.filter { item in
+                let fallback = group.id != "system" || !item.url.lastPathComponent.hasSuffix("history")
+                return memory.isSelected(item.url, default: fallback)
+            }.map(\.url)
+        })
+        phase = .results
+    }
+
     func scan() {
         phase = .scanning
-        Task {
-            groups = await PrivacyScanner.scan()
-            // Shell history is useful to most people, so it starts unselected; everything else starts selected.
-            selected = Set(groups.flatMap { g in g.items.filter { g.id != "system" || !$0.url.lastPathComponent.hasSuffix("history") }.map(\.url) })
-            phase = .results
-        }
+        Task { apply(await PrivacyScanner.scan()) }
     }
 
     func state(for g: PrivacyGroup) -> CheckState {
@@ -100,11 +145,15 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
     }
 
     func toggle(_ g: PrivacyGroup) {
-        if state(for: g) == .on { g.items.forEach { selected.remove($0.url) } } else { g.items.forEach { selected.insert($0.url) } }
+        let turnOn = state(for: g) != .on
+        if turnOn { g.items.forEach { selected.insert($0.url) } } else { g.items.forEach { selected.remove($0.url) } }
+        memory.set(g.items.map(\.url), selected: turnOn)
     }
 
     func toggle(_ i: PrivacyItem) {
-        if selected.contains(i.url) { selected.remove(i.url) } else { selected.insert(i.url) }
+        let turnOn = !selected.contains(i.url)
+        if turnOn { selected.insert(i.url) } else { selected.remove(i.url) }
+        memory.set(i.url, selected: turnOn)
     }
 
     func quit(bundleID: String) {
@@ -295,7 +344,7 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
 // MARK: - Apps
 
 @MainActor @Observable final class AppsModel {
-    enum Tab: String, CaseIterable { case apps = "Applications", leftovers = "Leftovers" }
+    enum Tab: String, CaseIterable { case apps = "Applications", updates = "Updates", leftovers = "Leftovers" }
     enum Sort: String, CaseIterable { case size = "Size", name = "Name", lastUsed = "Last used" }
 
     var tab: Tab = .apps
@@ -315,6 +364,20 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
     var scanningOrphans = false
 
     var message: String?
+
+    var updates: [AppUpdate] = []
+    var checkingUpdates = false
+    var updatesChecked: Date?
+
+    /// Looks up newer versions of installed apps (App Store and Sparkle feeds).
+    func checkUpdates() async {
+        guard !checkingUpdates else { return }
+        checkingUpdates = true
+        if !loaded { apps = await AppScanner.scan(); loaded = true }
+        updates = await AppUpdateChecker.check(apps)
+        updatesChecked = Date()
+        checkingUpdates = false
+    }
 
     var shown: [AppInfo] {
         var out = apps
@@ -438,12 +501,36 @@ enum Phase: Equatable { case idle, scanning, results, working, done }
 @MainActor @Observable final class MaintenanceModel {
     var running: String?
     var results: [String: (ok: Bool, message: String)] = [:]
+    /// Tasks that have evidence they would help right now (filled in by Smart Scan or "Check").
+    var advice: [MaintenanceAdvice] = []
+    var adviceChecked = false
+
+    func reason(for id: String) -> String? { advice.first { $0.task.id == id }?.reason }
+
+    func refreshAdvice(memoryPressure: Double) async {
+        advice = await MaintenanceAdvisor.recommend(memoryPressure: memoryPressure)
+        adviceChecked = true
+    }
 
     func run(_ task: Maintenance.Task) {
         running = task.id
         Task {
             let r = await Task.detached { Maintenance.run(task) }.value
             results[task.id] = r
+            if r.ok { advice.removeAll { $0.task.id == task.id } }
+            running = nil
+        }
+    }
+
+    /// Runs everything that is recommended; tasks needing administrator rights share one password prompt.
+    func runRecommended() {
+        let tasks = advice.map(\.task)
+        guard !tasks.isEmpty, running == nil else { return }
+        running = "recommended"
+        Task {
+            let r = await Task.detached { Maintenance.runMany(tasks) }.value
+            for (id, res) in r { results[id] = res }
+            advice.removeAll { r[$0.task.id]?.ok == true }
             running = nil
         }
     }
@@ -548,13 +635,14 @@ struct HealthIssue: Identifiable {
 
 @MainActor @Observable final class SmartScanModel {
     enum Step: Int, CaseIterable {
-        case junk, privacy, large, startup
+        case junk, privacy, updates, startup, maintenance
         var title: String {
             switch self {
             case .junk: "Searching for junk"
             case .privacy: "Checking privacy traces"
-            case .large: "Looking for large files"
+            case .updates: "Looking for app updates"
             case .startup: "Reviewing startup items"
+            case .maintenance: "Checking what needs maintenance"
             }
         }
     }
@@ -562,42 +650,41 @@ struct HealthIssue: Identifiable {
     var phase: Phase = .idle
     var completed: Set<Step> = []
     var current: Step?
-    var largeBytes: Int64 = 0
-    var largeCount = 0
     var startupCount = 0
     var unsignedStartup = 0
+    var updatesChecked = false
     var summary: RemovalSummary?
 
-    let junk: JunkModel, privacy: PrivacyModel, large: LargeFilesModel, startup: StartupModel
-    let largeProgress = ScanProgress()
-    var largePartial = false
+    let junk: JunkModel, privacy: PrivacyModel, startup: StartupModel
+    let apps: AppsModel, maintenance: MaintenanceModel, health: HealthModel
+    private var task: Task<Void, Never>?
 
-    init(junk: JunkModel, privacy: PrivacyModel, large: LargeFilesModel, startup: StartupModel) {
-        self.junk = junk; self.privacy = privacy; self.large = large; self.startup = startup
+    init(junk: JunkModel, privacy: PrivacyModel, startup: StartupModel,
+         apps: AppsModel, maintenance: MaintenanceModel, health: HealthModel) {
+        self.junk = junk; self.privacy = privacy; self.startup = startup
+        self.apps = apps; self.maintenance = maintenance; self.health = health
     }
 
     func run() {
-        phase = .scanning; completed = []; summary = nil; largePartial = false
-        largeProgress.reset()
-        Task {
+        phase = .scanning; completed = []; summary = nil; updatesChecked = false
+        task = Task {
             current = .junk
-            let r = await JunkScanner.scan()
-            junk.results = r
-            junk.selected = Set(r.filter { $0.category.risk == .safe }.flatMap(\.items).map(\.url))
-            junk.focused = junk.visible.first?.category.id
-            junk.phase = .results
+            junk.apply(await JunkScanner.scan())
             completed.insert(.junk)
+            if Task.isCancelled { return }
 
             current = .privacy
-            privacy.groups = await PrivacyScanner.scan()
+            privacy.apply(await PrivacyScanner.scan())
             completed.insert(.privacy)
+            if Task.isCancelled { return }
 
-            current = .large
-            // A big home folder can take many minutes to walk; Smart Scan gives it 45 seconds, or until Skip is pressed.
-            let found = await LargeFileScanner.scan(roots: LargeFileScanner.defaultRoots, minSize: 500_000_000, progress: largeProgress, timeLimit: 45)
-            largePartial = largeProgress.wasTruncated
-            largeCount = found.count; largeBytes = found.reduce(0) { $0 + $1.size }
-            completed.insert(.large)
+            current = .updates
+            if Prefs.bool(Prefs.checkAppUpdates, default: true) {
+                await apps.checkUpdates()
+                updatesChecked = true
+            }
+            completed.insert(.updates)
+            if Task.isCancelled { return }
 
             current = .startup
             let items = await StartupScanner.scan()
@@ -605,17 +692,25 @@ struct HealthIssue: Identifiable {
             startupCount = items.filter { $0.kind == .userAgent && $0.runsAtLoad }.count
             unsignedStartup = items.filter { $0.signed == false }.count
             completed.insert(.startup)
+            if Task.isCancelled { return }
+
+            current = .maintenance
+            await maintenance.refreshAdvice(memoryPressure: health.snap.memory.pressure)
+            completed.insert(.maintenance)
 
             current = nil
             phase = .results
         }
     }
 
+    func cancel() { task?.cancel(); current = nil; phase = .idle }
+
+    /// Deletes safe junk that is still ticked. Anything you unticked, here or on the System Junk page, stays.
     func cleanSafe() {
+        let (perm, trash) = junk.selection(safeOnly: true)
         phase = .working
-        let perm = junk.results.filter { $0.category.risk == .safe }.flatMap { r in r.items.map { ($0.url, $0.size) } }
         Task {
-            summary = await Task.detached { Remover.execute(permanent: perm, trash: []) }.value
+            summary = await Task.detached { Remover.execute(permanent: perm, trash: trash) }.value
             junk.reset()
             phase = .done
         }
@@ -641,10 +736,12 @@ struct HealthIssue: Identifiable {
     let maintenance = MaintenanceModel()
     let health = HealthModel()
     let smart: SmartScanModel
+    let updater = SelfUpdater()
 
     init() {
-        smart = SmartScanModel(junk: junk, privacy: privacy, large: large, startup: startup)
+        smart = SmartScanModel(junk: junk, privacy: privacy, startup: startup, apps: apps, maintenance: maintenance, health: health)
         health.start()
+        updater.start()
     }
 
     func refreshPermissions() { hasFDA = Permissions.hasFullDiskAccess() }

@@ -90,6 +90,23 @@ struct MaintenanceView: View {
                        subtitle: "Small fixes for common macOS annoyances. Some ask for your password.")
             ScrollView {
                 VStack(spacing: 12) {
+                    if !m.advice.isEmpty {
+                        Card {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(m.advice.count) task\(m.advice.count == 1 ? " is" : "s are") recommended right now").font(.headline)
+                                    Text("Based on what Aether found: " + m.advice.map(\.task.title).joined(separator: ", ") + ".")
+                                        .font(.callout).foregroundStyle(.white.opacity(0.7))
+                                }
+                                Spacer()
+                                if m.running == "recommended" { ProgressView().controlSize(.small) }
+                                else { Button("Run Recommended") { m.runRecommended() }.buttonStyle(PrimaryButtonStyle(tint: Module.maintenance.tint)).disabled(m.running != nil) }
+                            }
+                        }
+                    } else if m.adviceChecked {
+                        Label("Nothing needs doing right now. Run Smart Scan again to re-check.", systemImage: "checkmark.seal.fill")
+                            .font(.callout).foregroundStyle(.green).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 4)
+                    }
                     ForEach(Maintenance.tasks) { t in
                         Card {
                             HStack(spacing: 14) {
@@ -100,6 +117,11 @@ struct MaintenanceView: View {
                                         if t.needsAdmin { Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.secondary).help("Asks for your password") }
                                     }
                                     Text(t.detail).font(.callout).foregroundStyle(.secondary)
+                                    if let why = m.reason(for: t.id) {
+                                        Label(why, systemImage: "exclamationmark.circle.fill").font(.caption).foregroundStyle(.yellow)
+                                    } else if let last = Maintenance.lastRun(t.id), m.results[t.id] == nil {
+                                        Text("Last run \(last.shortAgo)").font(.caption).foregroundStyle(.white.opacity(0.45))
+                                    }
                                     if let r = m.results[t.id] {
                                         Label(r.message, systemImage: r.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
                                             .font(.caption).foregroundStyle(r.ok ? .green : .orange)

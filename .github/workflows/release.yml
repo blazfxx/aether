@@ -20,12 +20,13 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ditto -c -k --keepParent build/Aether.app "Aether-$VERSION-macos.zip"
+          shasum -a 256 "Aether-$VERSION-macos.zip" > "Aether-$VERSION-macos.zip.sha256"
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" Aether-*.zip --clobber
+            gh release upload "$GITHUB_REF_NAME" Aether-*.zip Aether-*.zip.sha256 --clobber
           else
-            gh release create "$GITHUB_REF_NAME" Aether-*.zip --generate-notes --title "Aether ${GITHUB_REF_NAME#v}"
+            gh release create "$GITHUB_REF_NAME" Aether-*.zip Aether-*.zip.sha256 --generate-notes --title "Aether ${GITHUB_REF_NAME#v}"
           fi

@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 APP="$ROOT/build/Aether.app"
-VERSION="1.0.2"
+VERSION="${AETHER_VERSION:-1.1.0}"   # AETHER_VERSION overrides it, e.g. to test the updater with an old number
 BUILD="$(date +%y%m%d%H%M)"
 
 echo "› compiling (release)"

@@ -9,8 +9,8 @@ struct SmartScanView: View {
         switch m.phase {
         case .idle:
             Hero(module: .smartScan, headline: "Smart Scan",
-                 detail: "One pass checks for junk, privacy traces, large files and startup items. Nothing is removed until you say so.",
-                 button: "Scan", note: "Takes about a minute. Your files are never uploaded anywhere.") { m.run() }
+                 detail: "One pass checks for junk, privacy traces, app updates and startup items, and says which maintenance is actually needed. Nothing is removed until you say so.",
+                 button: "Scan", note: "Takes about a minute. Your files are never uploaded anywhere; the update check only asks whether newer versions exist.") { m.run() }
         case .scanning:
             ScanSteps(model: m)
         case .results:
@@ -49,26 +49,12 @@ private struct ScanSteps: View {
                     }
                 }
             }
-            if model.current == .large {
-                // Walking a big home folder takes a while, and macOS may be waiting for you to allow access to a folder.
-                TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-                    let p = model.largeProgress.snapshot
-                    VStack(spacing: 8) {
-                        Text("\(p.files.formatted()) files checked")
-                            .font(.callout).foregroundStyle(.white.opacity(0.75))
-                        if !p.current.isEmpty {
-                            Text(p.current).font(.caption).lineLimit(1).truncationMode(.middle)
-                                .foregroundStyle(.white.opacity(0.45)).frame(maxWidth: 420)
-                        } else {
-                            Text("If macOS asks for access to a folder, choose Allow.")
-                                .font(.caption).foregroundStyle(.white.opacity(0.6))
-                        }
-                        Button("Skip large files") { model.largeProgress.cancel() }
-                            .buttonStyle(.plain).font(.callout).foregroundStyle(.white.opacity(0.85))
-                            .padding(.top, 4)
-                    }
-                }
+            if model.current == .junk || model.current == .privacy {
+                // Reading folders macOS protects can pause behind a permission dialog.
+                Text("If macOS asks to let Aether access a folder, choose Allow.")
+                    .font(.caption).foregroundStyle(.white.opacity(0.55))
             }
+            Button("Stop") { model.cancel() }.buttonStyle(SoftButtonStyle())
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -80,28 +66,36 @@ private struct SmartResults: View {
     @State private var confirm = false
 
     var body: some View {
-        let junk = model.junk, privacy = model.privacy
+        let junk = model.junk, privacy = model.privacy, apps = model.apps, maint = model.maintenance
         let health = state.health
-        let safe = junk.safeBytes
-        let review = junk.totalFound - safe
+        let safe = junk.safeSelectedBytes
+        let held = junk.safeBytes - safe
+        let review = junk.totalFound - junk.safeBytes
 
         VStack(spacing: 0) {
             PageHeader(module: .smartScan, title: "Scan complete",
-                       subtitle: safe > 0 ? "\(Bytes.string(safe)) of junk is safe to remove right now." : "Nothing risky found.")
+                       subtitle: safe > 0 ? "\(Bytes.string(safe)) of junk is safe to remove right now." : "Nothing selected to remove.")
             ScrollView {
                 VStack(spacing: 12) {
                     ResultRow(module: .junk, title: "System Junk",
-                              detail: review > 0 ? "\(Bytes.string(review)) more needs a look before it goes." : "Caches, logs and build leftovers.",
+                              detail: junkDetail(review: review, held: held),
                               value: Bytes.string(junk.totalFound), button: "Review") { state.selection = .junk }
                     ResultRow(module: .privacy, title: "Privacy",
                               detail: "Browser history, cookies and recent-item traces.",
                               value: privacy.groups.isEmpty ? "None" : Bytes.string(privacy.totalFound), button: "Review") { state.selection = .privacy }
-                    ResultRow(module: .largeFiles, title: "Large Files",
-                              detail: model.largePartial ? "Only part of your folders was checked: \(model.largeCount) file\(model.largeCount == 1 ? "" : "s") over 500 MB so far. Review scans the rest." : model.largeCount == 0 ? "No files over 500 MB in your main folders." : "\(model.largeCount) file\(model.largeCount == 1 ? "" : "s") over 500 MB.",
-                              value: Bytes.string(model.largeBytes), button: "Review") { state.selection = .largeFiles }
+                    ResultRow(module: .apps, title: "App Updates",
+                              detail: updatesDetail(apps),
+                              value: model.updatesChecked ? (apps.updates.isEmpty ? "Up to date" : "\(apps.updates.count) available") : "Skipped",
+                              button: "Review") { apps.tab = .updates; state.selection = .apps }
                     ResultRow(module: .startup, title: "Startup Items",
                               detail: model.unsignedStartup > 0 ? "\(model.unsignedStartup) background item\(model.unsignedStartup == 1 ? " is" : "s are") not code-signed." : "All background items are signed.",
                               value: "\(model.startupCount) at login", button: "Review") { state.selection = .startup }
+                    ResultRow(module: .maintenance, title: "Maintenance",
+                              detail: maintenanceDetail(maint),
+                              value: maint.advice.isEmpty ? "All good" : "\(maint.advice.count) needed",
+                              button: maint.advice.isEmpty ? "Open" : (maint.running == nil ? "Run" : "Running…")) {
+                        if maint.advice.isEmpty { state.selection = .maintenance } else { maint.runRecommended() }
+                    }
                     ResultRow(module: .health, title: "Mac Health",
                               detail: health.issues.first?.title ?? "Nothing needs attention.",
                               value: health.verdict, button: "Open") { state.selection = .health }
@@ -109,7 +103,7 @@ private struct SmartResults: View {
                 .padding(.horizontal, 24).padding(.bottom, 20)
             }
             ActionBar(summary: safe > 0 ? "Clean \(Bytes.string(safe)) of safe junk" : "Nothing to clean automatically",
-                      sub: "Caches and logs are deleted. Review items are never touched here.",
+                      sub: "Caches and logs are deleted. Review items are never touched here, and neither is anything you unticked.",
                       module: .smartScan, buttonTitle: "Clean", enabled: safe > 0) { confirm = true } trailing: {
                 Button("Scan Again") { model.run() }.buttonStyle(SoftButtonStyle())
             }
@@ -119,6 +113,28 @@ private struct SmartResults: View {
         } message: {
             Text("These are caches and logs that apps rebuild on their own. This can't be undone.")
         }
+    }
+
+    private func junkDetail(review: Int64, held: Int64) -> String {
+        var parts = ["Caches, logs and build leftovers."]
+        if held > 0 { parts = ["\(Bytes.string(held)) is unticked, as you left it."] }
+        if review > 0 { parts.append("\(Bytes.string(review)) more needs a look before it goes.") }
+        return parts.joined(separator: " ")
+    }
+
+    private func updatesDetail(_ apps: AppsModel) -> String {
+        guard model.updatesChecked else { return "Turned off in Settings." }
+        if apps.updates.isEmpty { return "Every app that publishes updates is current." }
+        let names = apps.updates.prefix(3).map(\.app.name).joined(separator: ", ")
+        return apps.updates.count > 3 ? "\(names) and \(apps.updates.count - 3) more." : names + "."
+    }
+
+    private func maintenanceDetail(_ m: MaintenanceModel) -> String {
+        if m.advice.isEmpty {
+            if let done = m.results.values.first(where: { $0.ok }) { return "Done: \(done.message)." }
+            return "Nothing needs doing right now."
+        }
+        return m.advice.map { "\($0.task.title): \($0.reason)" }.joined(separator: " ")
     }
 }
 

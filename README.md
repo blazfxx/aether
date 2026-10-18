@@ -4,14 +4,14 @@ A Mac cleaning and care suite for macOS 14+, written in Swift and SwiftUI. Glass
 
 | Section | What it does |
 |---|---|
-| **Smart Scan** | One pass over junk, privacy traces, large files and startup items, with a one-click "clean safe junk" |
+| **Smart Scan** | One pass over junk, privacy traces, app updates, startup items and the maintenance that is actually needed, with a one-click "clean safe junk" (it skips anything you unticked) |
 | **Mac Health** | Live CPU, memory, disk, battery and network, a health score, and what to fix |
 | **System Junk** | Caches, logs, crash reports, Xcode and developer caches, Trash, old installers, Mail downloads, device backups |
 | **Privacy** | Browser history, cookies and cache (Safari, Chrome, Edge, Brave, Arc, Firefox), recent items, shell history |
 | **Large & Old Files** | Biggest files in your main folders and how long since you opened them |
 | **Duplicates** | Byte-for-byte duplicate finder; always keeps at least one copy |
 | **Space Lens** | Treemap of disk usage with drill-down |
-| **Uninstaller** | Removes an app plus its leftover files; finds orphaned leftovers from apps already gone |
+| **Uninstaller** | Removes an app plus its leftover files; finds orphaned leftovers; an Updates tab shows apps with newer versions |
 | **Startup Items** | Launch agents and login items, with code-signature checks |
 | **Maintenance** | DNS flush, Spotlight reindex, Launch Services rebuild, Quick Look reset |
 | **Menu bar** | Live stats and Quick Clean |
@@ -23,7 +23,8 @@ Every deletion goes through one function, `Remover`, which enforces an allowlist
 - Regenerable data (caches, logs) is deleted permanently.
 - Anything you might want back (large files, duplicates, apps, leftovers, installers, backups) goes to the **Trash**.
 - Items flagged *Review* start unselected. Orphaned-leftover matches are never preselected.
-- Nothing is uploaded. There is no network code.
+- Nothing about your files is ever uploaded. The only network use is update checks: Aether's own releases on GitHub, and other apps' versions from the App Store or each app's own update feed.
+- Aether updates itself (Settings to turn it off): the download is verified (checksum, code signature, app identity) and swapped in when you quit.
 
 ## Build
 

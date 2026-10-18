@@ -120,15 +120,118 @@ public enum Maintenance {
              command: "/usr/bin/qlmanage -r cache"),
     ]
 
+    public static func task(_ id: String) -> Task? { tasks.first { $0.id == id } }
+
+    // MARK: Running
+
     public static func run(_ task: Task) -> (ok: Bool, message: String) {
-        if task.needsAdmin {
-            let escaped = task.command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-            let script = "do shell script \"\(escaped)\" with administrator privileges"
-            let (code, out) = runCapture("/usr/bin/osascript", ["-e", script])
-            return (code == 0, code == 0 ? "Done" : (out.contains("-128") ? "Cancelled" : "Failed: \(out.trimmingCharacters(in: .whitespacesAndNewlines))"))
+        let result = task.needsAdmin ? runAsAdmin(task.command) : runPlain(task.command)
+        if result.ok { recordRun(task.id) }
+        return result
+    }
+
+    /// Runs several tasks. Everything that needs administrator rights is combined so the password is asked for once.
+    public static func runMany(_ tasks: [Task]) -> [String: (ok: Bool, message: String)] {
+        var results: [String: (ok: Bool, message: String)] = [:]
+        for t in tasks where !t.needsAdmin { results[t.id] = run(t) }
+        let admin = tasks.filter(\.needsAdmin)
+        if !admin.isEmpty {
+            let r = runAsAdmin(admin.map(\.command).joined(separator: "; "))
+            for t in admin { results[t.id] = r; if r.ok { recordRun(t.id) } }
         }
-        let (code, out) = runCapture("/bin/sh", ["-c", task.command])
+        return results
+    }
+
+    private static func runAsAdmin(_ command: String) -> (ok: Bool, message: String) {
+        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "do shell script \"\(escaped)\" with administrator privileges"
+        let (code, out) = runCapture("/usr/bin/osascript", ["-e", script])
+        if code == 0 { return (true, "Done") }
+        return (false, out.contains("-128") ? "Cancelled" : "Failed: \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+
+    private static func runPlain(_ command: String) -> (ok: Bool, message: String) {
+        let (code, out) = runCapture("/bin/sh", ["-c", command])
         return (code == 0, code == 0 ? "Done" : "Failed: \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+
+    // MARK: History
+
+    private static func key(_ id: String) -> String { "aether.maintenance.lastRun.\(id)" }
+    public static func lastRun(_ id: String) -> Date? { UserDefaults.standard.object(forKey: key(id)) as? Date }
+    static func recordRun(_ id: String) { UserDefaults.standard.set(Date(), forKey: key(id)) }
+}
+
+// MARK: - What actually needs doing
+
+public struct MaintenanceAdvice: Identifiable, Sendable {
+    public var id: String { task.id }
+    public let task: Maintenance.Task
+    /// Plain-language evidence for why this is recommended.
+    public let reason: String
+}
+
+/// Recommends maintenance only when there is evidence it will help, never on a schedule.
+/// Rebuilding Launch Services and resetting Quick Look have no cheap test, so they are never suggested automatically.
+public enum MaintenanceAdvisor {
+    public static let slowDNSSeconds = 1.5
+    public static let heavyMemoryPressure = 0.85
+
+    public static func recommend(memoryPressure: Double) async -> [MaintenanceAdvice] {
+        async let dns = Task.detached { dnsLookupSeconds() }.value
+        async let spotlight = Task.detached { spotlightProblem() }.value
+        var out: [MaintenanceAdvice] = []
+
+        if let t = Maintenance.task("dns"), let seconds = await dns, seconds > slowDNSSeconds {
+            out.append(.init(task: t, reason: "Looking up a website took \(String(format: "%.1f", seconds)) seconds."))
+        }
+        if let t = Maintenance.task("spotlight"), let problem = await spotlight {
+            out.append(.init(task: t, reason: problem))
+        }
+        if let t = purgeAdvice(memoryPressure: memoryPressure) { out.append(t) }
+        return out
+    }
+
+    static func purgeAdvice(memoryPressure: Double) -> MaintenanceAdvice? {
+        guard memoryPressure >= heavyMemoryPressure, let t = Maintenance.task("purge") else { return nil }
+        return .init(task: t, reason: "Memory is \(Int(memoryPressure * 100))% in use.")
+    }
+
+    /// Seconds a DNS lookup took, or nil if it failed (offline: flushing the cache would not help).
+    static func dnsLookupSeconds(host: String = "www.apple.com", giveUpAfter: TimeInterval = 4) -> Double? {
+        let start = Date()
+        let done = DispatchSemaphore(value: 0)
+        let box = LookupBox()
+        DispatchQueue.global(qos: .utility).async {
+            var hints = addrinfo(); hints.ai_socktype = SOCK_STREAM
+            var res: UnsafeMutablePointer<addrinfo>?
+            let status = getaddrinfo(host, nil, &hints, &res)
+            if res != nil { freeaddrinfo(res) }
+            box.ok = status == 0
+            done.signal()
+        }
+        if done.wait(timeout: .now() + giveUpAfter) == .timedOut { return giveUpAfter }
+        return box.ok ? Date().timeIntervalSince(start) : nil
+    }
+
+    private final class LookupBox: @unchecked Sendable { var ok = false }
+
+    static func spotlightProblem() -> String? {
+        let (c1, count) = runCapture("/usr/bin/mdfind", ["-count", "-onlyin", "/Applications", "kMDItemContentType == 'com.apple.application-bundle'"])
+        guard c1 == 0, let n = Int(count.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        guard n == 0 else { return spotlightVerdict(appCount: n, volumeStatus: nil) }
+        // `/` is the sealed system volume (indexing is always off there). Your files live on the Data volume.
+        let volume = FileManager.default.fileExists(atPath: "/System/Volumes/Data") ? "/System/Volumes/Data" : "/"
+        let (c2, status) = runCapture("/usr/bin/mdutil", ["-s", volume])
+        return spotlightVerdict(appCount: n, volumeStatus: c2 == 0 ? status : nil)
+    }
+
+    /// Spotlight is only worth reindexing when it is switched on yet can't find a single app. If indexing is
+    /// off on purpose, a reindex wouldn't change that, so nothing is suggested.
+    static func spotlightVerdict(appCount: Int?, volumeStatus: String?) -> String? {
+        guard appCount == 0, let status = volumeStatus?.lowercased() else { return nil }
+        if status.contains("indexing disabled") { return nil }
+        return "Spotlight can't find any of your apps."
     }
 }
 

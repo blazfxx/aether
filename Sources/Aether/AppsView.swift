@@ -12,9 +12,13 @@ struct AppsView: View {
             Picker("", selection: $m.tab) {
                 ForEach(AppsModel.Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
-            .pickerStyle(.segmented).labelsHidden().frame(width: 280)
+            .pickerStyle(.segmented).labelsHidden().frame(width: 360)
             .padding(.bottom, 12)
-            if m.tab == .apps { AppList(model: m) } else { LeftoverList(model: m) }
+            switch m.tab {
+            case .apps: AppList(model: m)
+            case .updates: UpdatesList(model: m)
+            case .leftovers: LeftoverList(model: m)
+            }
             if let msg = m.message {
                 HStack {
                     Text(msg).font(.callout)
@@ -189,6 +193,49 @@ private struct LeftoverList: View {
                 Button("Move to Trash", role: .destructive) { model.trashOrphans() }
             } message: {
                 Text("You can restore them from the Trash if an app misbehaves.")
+            }
+        }
+    }
+}
+
+private struct UpdatesList: View {
+    @Bindable var model: AppsModel
+
+    var body: some View {
+        if model.checkingUpdates {
+            ScanningView(module: .apps, title: "Checking for updates", label: "Asking the App Store and each app's update feed")
+        } else if model.updatesChecked == nil {
+            Hero(module: .apps, headline: "App Updates",
+                 detail: "Finds newer versions of your apps from the App Store and from the apps' own update feeds. Aether doesn't install them for you: it opens the App Store or the download page.",
+                 button: "Check Now",
+                 note: "Only asks whether a newer version exists. Nothing about your files is sent.") { Task { await model.checkUpdates() } }
+        } else if model.updates.isEmpty {
+            DoneView(module: .apps, headline: "Your apps are up to date",
+                     detail: "Checked \(model.updatesChecked?.shortAgo ?? "just now"). Apps that don't publish an update feed can't be checked.") {
+                model.updatesChecked = nil
+            }
+        } else {
+            VStack(spacing: 0) {
+                List(model.updates) { u in
+                    HStack(spacing: 12) {
+                        FileIcon(url: u.app.url, size: 32)
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(u.app.name).lineLimit(1)
+                                Tag(text: u.sourceName.uppercased(), color: .blue)
+                            }
+                            Text("\(u.installed) → \(u.latest)").font(.caption).foregroundStyle(.white.opacity(0.65))
+                        }
+                        Spacer()
+                        Button("Update") { if let url = u.openURL { NSWorkspace.shared.open(url) } }
+                            .buttonStyle(SoftButtonStyle()).disabled(u.openURL == nil)
+                    }
+                    .padding(.vertical, 2)
+                }
+                .listStyle(.inset).glassPanel().padding(.horizontal, 24)
+                ActionBar(summary: "\(model.updates.count) update\(model.updates.count == 1 ? "" : "s") available",
+                          sub: "Checked \(model.updatesChecked?.shortAgo ?? "just now"). Update opens the App Store or the developer's download.",
+                          module: .apps, buttonTitle: "Check Again") { Task { await model.checkUpdates() } }
             }
         }
     }

@@ -16,12 +16,19 @@ struct AetherApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { Task { await state.updater.check(userInitiated: true) } }
+            }
             CommandMenu("Go") {
                 ForEach(Array(Module.allCases.enumerated()), id: \.element.id) { i, m in
                     Button(m.title) { state.selection = m }
                         .keyboardShortcut(KeyEquivalent(Character("\(i + 1 == 10 ? 0 : i + 1)")), modifiers: .command)
                 }
             }
+        }
+
+        Settings {
+            SettingsView().environment(state)
         }
 
         MenuBarExtra(isInserted: $showMenuBar) {
@@ -46,6 +53,7 @@ struct ContentView: View {
                 Sidebar(selection: Binding(get: { state.selection }, set: { state.selection = $0 }))
                     .frame(width: 244)
                 VStack(spacing: 0) {
+                    UpdateBanner()
                     if !state.hasFDA && !state.bannerDismissed {
                         FullDiskAccessBanner()
                     }
@@ -116,7 +124,8 @@ struct Sidebar: View {
                 }
                 .padding(.horizontal, 12).padding(.top, 42)
             }
-            DiskFooter().padding(12)
+            DiskFooter().padding(.horizontal, 12).padding(.top, 12).padding(.bottom, 4)
+            VersionLabel().padding(.bottom, 10)
         }
         .background(.black.opacity(0.16))
         .overlay(alignment: .trailing) { Rectangle().fill(.white.opacity(0.07)).frame(width: 1) }
@@ -225,7 +234,8 @@ struct MenuBarView: View {
                 busy = true; quickMessage = nil
                 Task {
                     let r = await JunkScanner.scan(JunkCatalog.all.filter { $0.risk == .safe })
-                    let items = r.flatMap { res in res.items.map { ($0.url, $0.size) } }
+                    // Anything you unticked in System Junk or Smart Scan stays put.
+                    let items = r.flatMap { res in res.items.filter { SelectionMemory.shared.choice(for: $0.url) != false }.map { ($0.url, $0.size) } }
                     let summary = await Task.detached { Remover.execute(permanent: items, trash: []) }.value
                     quickMessage = summary.count == 0 ? "Already clean" : summary.headline
                     busy = false
@@ -257,5 +267,119 @@ struct MiniGauge: View {
             Text(title).font(.caption2.weight(.medium))
             Text(caption).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
         }.frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: - Updates UI
+
+struct VersionLabel: View {
+    @Environment(AppState.self) private var state
+    var body: some View {
+        let u = state.updater
+        HStack(spacing: 5) {
+            Text("Aether \(u.currentVersion)").foregroundStyle(.white.opacity(0.4))
+            switch u.state {
+            case .available, .ready, .downloading: Circle().fill(.green).frame(width: 6, height: 6)
+            default: EmptyView()
+            }
+        }
+        .font(.system(size: 10.5))
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// Top-of-window notice for Aether's own updates. Quiet unless there is something to do.
+struct UpdateBanner: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        let u = state.updater
+        switch u.state {
+        case .available(let r):
+            row(icon: "arrow.down.circle.fill", title: "Aether \(r.version) is available",
+                detail: u.canReplaceItself ? "You have \(u.currentVersion)." : "This copy can't update itself. Get the new version from GitHub.") {
+                if u.canReplaceItself { Button("Download & Install") { u.downloadAvailable() }.buttonStyle(SoftButtonStyle()) }
+                else { Button("View Release") { u.openReleasePage(r) }.buttonStyle(SoftButtonStyle()) }
+            }
+        case .downloading(let v):
+            row(icon: "arrow.down.circle", title: "Downloading Aether \(v)", detail: "It installs when you quit, or restart to update now.") {
+                ProgressView().controlSize(.small)
+            }
+        case .ready(let v, _):
+            row(icon: "checkmark.circle.fill", title: "Aether \(v) is ready",
+                detail: Prefs.bool(Prefs.autoInstallUpdates, default: true) ? "It installs when you quit Aether, or restart now." : "Restart Aether to finish updating.") {
+                Button("Restart to Update") { u.restartToUpdate() }.buttonStyle(SoftButtonStyle())
+            }
+        case .installing:
+            row(icon: "gearshape.2", title: "Installing update…", detail: "Aether will reopen.") { ProgressView().controlSize(.small) }
+        case .failed(let m):
+            row(icon: "exclamationmark.triangle.fill", title: "Update didn't work", detail: m) {
+                Button("Dismiss") { u.dismissFailure() }.buttonStyle(SoftButtonStyle())
+            }
+        case .checking:
+            row(icon: "arrow.triangle.2.circlepath", title: "Checking for updates…", detail: "") { ProgressView().controlSize(.small) }
+        case .upToDate:
+            row(icon: "checkmark.seal.fill", title: "Aether is up to date", detail: "Version \(u.currentVersion).") {
+                Button("OK") { u.state = .idle }.buttonStyle(SoftButtonStyle())
+            }
+        case .idle:
+            EmptyView()
+        }
+    }
+
+    private func row<Trailing: View>(icon: String, title: String, detail: String, @ViewBuilder trailing: () -> Trailing) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon).font(.title3).foregroundStyle(.white)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.callout.weight(.medium))
+                if !detail.isEmpty { Text(detail).font(.caption).foregroundStyle(.white.opacity(0.65)) }
+            }
+            Spacer()
+            trailing()
+        }
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .glass(radius: 14, fill: 0.12)
+        .padding(.horizontal, 24).padding(.top, 14)
+    }
+}
+
+struct SettingsView: View {
+    @Environment(AppState.self) private var state
+    @AppStorage(Prefs.autoCheckUpdates) private var autoCheck = true
+    @AppStorage(Prefs.autoInstallUpdates) private var autoInstall = true
+    @AppStorage(Prefs.checkAppUpdates) private var checkApps = true
+    @State private var remembered = SelectionMemory.shared.count
+
+    var body: some View {
+        let u = state.updater
+        Form {
+            Section("Aether updates") {
+                LabeledContent("Version", value: u.currentVersion)
+                LabeledContent("Status", value: u.statusLine)
+                Toggle("Check for updates automatically", isOn: $autoCheck)
+                Toggle("Download and install updates automatically", isOn: $autoInstall)
+                    .disabled(!autoCheck)
+                Text("A new version is downloaded from Aether's GitHub releases, checked (checksum, signature, app identity) and swapped in when you quit. Nothing about your files or your Mac is sent.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Check Now") { Task { await u.check(userInitiated: true) } }
+                    if case .ready = u.state { Button("Restart to Update") { u.restartToUpdate() } }
+                }
+            }
+            Section("Smart Scan") {
+                Toggle("Look for updates to your other apps", isOn: $checkApps)
+                Text("Asks the App Store, or the developer's own update feed, whether a newer version exists. Aether doesn't install other apps' updates; it opens the App Store or the download page.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Remembered choices") {
+                LabeledContent("Items you ticked or unticked", value: "\(remembered)")
+                Button("Forget All") { SelectionMemory.shared.forgetAll(); remembered = 0 }.disabled(remembered == 0)
+                Text("Aether remembers what you unticked in System Junk and Privacy, so the next scan starts the same way.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 480)
+        .padding(.vertical, 8)
     }
 }
