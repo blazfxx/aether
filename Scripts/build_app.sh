@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 APP="$ROOT/build/Aether.app"
-VERSION="1.0.1"
+VERSION="1.0.2"
 BUILD="$(date +%y%m%d%H%M)"
 
 echo "› compiling (release)"
